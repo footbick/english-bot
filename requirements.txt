@@ -1,5 +1,5 @@
 --only-binary=:all:
-aiogram==3.4.1
+aiohttp==3.9.5
 groq
 gtts
 PyPDF2
