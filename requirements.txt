@@ -1,7 +1,7 @@
 --only-binary=:all:
-aiohttp==3.9.5
+aiogram==3.4.1
 groq
 gtts
 PyPDF2
-aiohttp
+aiohttp==3.9.5
 pydantic==2.5.3
