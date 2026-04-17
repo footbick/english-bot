@@ -1,4 +1,7 @@
 services:
   - type: web
+    name: english-bot
     env: python
-    runtime: python-3.11.8
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    pythonVersion: 3.11.8
