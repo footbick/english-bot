@@ -1,0 +1,4 @@
+services:
+  - type: web
+    env: python
+    runtime: python-3.11.8
