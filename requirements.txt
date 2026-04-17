@@ -3,3 +3,4 @@ groq
 gtts
 PyPDF2
 aiohttp
+pydantic==2.5.3
