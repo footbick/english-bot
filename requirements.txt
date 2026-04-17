@@ -1,3 +1,4 @@
+--only-binary=:all:
 aiogram==3.4.1
 groq
 gtts
