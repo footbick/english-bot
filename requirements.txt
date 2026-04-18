@@ -1,6 +1,7 @@
-aiogram
+aiogram>=3.17.0
 groq
 gtts
 PyPDF2
 aiohttp>=3.13.0
 pydantic>=2.10.0
+python-dotenv
