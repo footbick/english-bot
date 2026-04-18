@@ -9,6 +9,7 @@ import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, PollAnswer
 from groq import Groq
+from aiohttp import web  # Добавили для веб-сервера
 
 # =========================
 # LOGS
@@ -26,6 +27,27 @@ dp = Dispatcher()
 client = Groq(api_key=GROQ_API_KEY)
 
 user_sessions = {}
+
+# =========================
+# WEB SERVER (KEEP-ALIVE FOR RENDER)
+# =========================
+async def handle(request):
+    """Ответ для проверки работоспособности (health check)"""
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    """Запуск веб-сервера на порту, который требует Render"""
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render передает порт в переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    
+    logging.info(f"Starting web server on port {port}...")
+    await site.start()
 
 # =========================
 # DB
@@ -48,13 +70,10 @@ init_db()
 ai_queue = asyncio.Queue()
 ai_semaphore = asyncio.Semaphore(2)
 
-
 async def _ai_call(prompt, system_msg, json_mode=False):
     loop = asyncio.get_event_loop()
-
     def call():
         fmt = {"type": "json_object"} if json_mode else None
-
         for attempt in range(3):
             try:
                 response = client.chat.completions.create(
@@ -67,13 +86,11 @@ async def _ai_call(prompt, system_msg, json_mode=False):
                 )
                 return response.choices[0].message.content
             except Exception as e:
-                print(f"[GROQ ERROR] attempt {attempt}: {e}")
-
+                logging.error(f"[GROQ ERROR] attempt {attempt}: {e}")
         return None
 
     async with ai_semaphore:
         return await loop.run_in_executor(None, call)
-
 
 async def ai_worker():
     while True:
@@ -82,27 +99,23 @@ async def ai_worker():
             res = await _ai_call(job["prompt"], job["system"], job["json_mode"])
             job["future"].set_result(res)
         except Exception as e:
-            print("[AI WORKER ERROR]", e)
+            logging.error(f"[AI WORKER ERROR] {e}")
             job["future"].set_result(None)
         finally:
             ai_queue.task_done()
 
-
 async def ai_request(prompt, system_msg, json_mode=False):
     future = asyncio.get_event_loop().create_future()
-
     await ai_queue.put({
         "prompt": prompt,
         "system": system_msg,
         "json_mode": json_mode,
         "future": future
     })
-
     try:
         return await asyncio.wait_for(future, timeout=25)
     except asyncio.TimeoutError:
         return None
-
 
 # =========================
 # SAFE JSON
@@ -120,7 +133,6 @@ def safe_json(text):
                 return None
         return None
 
-
 # =========================
 # LOGIC
 # =========================
@@ -128,14 +140,11 @@ async def send_next_step(user_id):
     sess = user_sessions.get(user_id)
     if not sess:
         return
-
     if sess.get("step", 0) >= 10:
         await bot.send_message(user_id, f"🏁 Done! Score: {sess.get('score', 0)}/10")
         user_sessions.pop(user_id, None)
         return
-
     await grammar_q(user_id, sess)
-
 
 async def grammar_q(user_id, sess):
     raw = await ai_request(
@@ -143,14 +152,11 @@ async def grammar_q(user_id, sess):
         "Return JSON only",
         json_mode=True
     )
-
     data = safe_json(raw)
     if not data:
         await bot.send_message(user_id, "AI error, retrying...")
         return
-
     sess["correct"] = data["c"]
-
     await bot.send_poll(
         user_id,
         data["q"],
@@ -159,7 +165,6 @@ async def grammar_q(user_id, sess):
         correct_option_id=data["c"],
         is_anonymous=False
     )
-
 
 # =========================
 # HANDLERS
@@ -172,35 +177,38 @@ async def start(m: types.Message):
     )
     await m.answer("Ready 🚀", reply_markup=kb)
 
-
 @dp.message(F.text == "Start test")
 async def start_test(m: types.Message):
     user_sessions[m.from_user.id] = {"step": 0, "score": 0}
     await send_next_step(m.from_user.id)
-
 
 @dp.poll_answer()
 async def handle_poll(p: PollAnswer):
     uid = p.user.id
     if uid not in user_sessions:
         return
-
     sess = user_sessions[uid]
-
     if p.option_ids and p.option_ids[0] == sess.get("correct"):
         sess["score"] += 1
-
     sess["step"] += 1
     await send_next_step(uid)
-
 
 # =========================
 # MAIN
 # =========================
 async def main():
+    # 1. Запускаем AI воркера
     asyncio.create_task(ai_worker())
+    
+    # 2. Запускаем веб-сервер для Render (костыль для порта)
+    asyncio.create_task(start_web_server())
+    
+    # 3. Запускаем опрос Telegram
+    logging.info("Starting bot polling...")
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped.")
