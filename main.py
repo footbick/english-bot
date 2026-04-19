@@ -37,10 +37,13 @@ user_sessions = {}
 # DATABASE SETUP (SQLAlchemy)
 # =========================
 Base = declarative_base()
+# Замени старую строку engine = create_engine... на это:
 engine = create_engine(
-    DATABASE_URL, 
-    pool_pre_ping=True, 
-    connect_args={'sslmode': 'require'}
+    DATABASE_URL,
+    connect_args={
+        "options": "-c endpoint=qmytswodftgctaojwiia",
+        "sslmode": "require"
+    }
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
