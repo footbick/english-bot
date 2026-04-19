@@ -1,26 +1,31 @@
 import os
 import io
 import asyncio
-import sqlite3
 import random
 import json
 import logging
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, PollAnswer
-from groq import Groq
-from aiohttp import web  # Добавили для веб-сервера
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer, BufferedInputFile
+from aiohttp import web
+from PyPDF2 import PdfReader
+from groq import Groq, RateLimitError
+from gtts import gTTS
+
+# Библиотеки для работы с PostgreSQL
+from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import func
 
 # =========================
-# LOGS
+# LOGS & CONFIG
 # =========================
 logging.basicConfig(level=logging.INFO)
 
-# =========================
-# ENV
-# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL") # Твоя ссылка от Supabase
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -29,186 +34,201 @@ client = Groq(api_key=GROQ_API_KEY)
 user_sessions = {}
 
 # =========================
-# WEB SERVER (KEEP-ALIVE FOR RENDER)
+# DATABASE SETUP (SQLAlchemy)
+# =========================
+Base = declarative_base()
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class User(Base):
+    __tablename__ = "users"
+    user_id = Column(BigInteger, primary_key=True)
+
+class Vocab(Base):
+    __tablename__ = "vocab"
+    id = Column(Integer, primary_key=True, index=True)
+    word = Column(String)
+    definition = Column(Text)
+    category = Column(String)
+    source = Column(String)
+
+# Создаем таблицы в Supabase, если их еще нет
+Base.metadata.create_all(bind=engine)
+
+# =========================
+# WEB SERVER (FOR RENDER)
 # =========================
 async def handle(request):
-    """Ответ для проверки работоспособности (health check)"""
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running and connected to Supabase!")
 
 async def start_web_server():
-    """Запуск веб-сервера на порту, который требует Render"""
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Render передает порт в переменную окружения PORT
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
-    
-    logging.info(f"Starting web server on port {port}...")
+    logging.info(f"Web server started on port {port}")
     await site.start()
 
 # =========================
-# DB
+# AI TOOLS
 # =========================
-def init_db():
-    conn = sqlite3.connect("english_coach.db")
-    conn.execute("""CREATE TABLE IF NOT EXISTS vocab (
-        id INTEGER PRIMARY KEY,
-        word TEXT,
-        definition TEXT
-    )""")
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# =========================
-# AI QUEUE
-# =========================
-ai_queue = asyncio.Queue()
-ai_semaphore = asyncio.Semaphore(2)
-
-async def _ai_call(prompt, system_msg, json_mode=False):
+async def ai_request(prompt, system_msg, json_mode=False, user_id=None):
     loop = asyncio.get_event_loop()
     def call():
         fmt = {"type": "json_object"} if json_mode else None
-        for attempt in range(3):
-            try:
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": prompt[:3500]}
-                    ],
-                    response_format=fmt
-                )
-                return response.choices[0].message.content
-            except Exception as e:
-                logging.error(f"[GROQ ERROR] attempt {attempt}: {e}")
-        return None
-
-    async with ai_semaphore:
+        return client.chat.completions.create(
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile", response_format=fmt
+        ).choices[0].message.content
+    
+    try:
         return await loop.run_in_executor(None, call)
-
-async def ai_worker():
-    while True:
-        job = await ai_queue.get()
-        try:
-            res = await _ai_call(job["prompt"], job["system"], job["json_mode"])
-            job["future"].set_result(res)
-        except Exception as e:
-            logging.error(f"[AI WORKER ERROR] {e}")
-            job["future"].set_result(None)
-        finally:
-            ai_queue.task_done()
-
-async def ai_request(prompt, system_msg, json_mode=False):
-    future = asyncio.get_event_loop().create_future()
-    await ai_queue.put({
-        "prompt": prompt,
-        "system": system_msg,
-        "json_mode": json_mode,
-        "future": future
-    })
-    try:
-        return await asyncio.wait_for(future, timeout=25)
-    except asyncio.TimeoutError:
+    except RateLimitError:
+        if user_id:
+            try: await bot.send_message(user_id, "⚠️ Groq Limit Reached.")
+            except: pass
+        return None
+    except Exception as e:
+        logging.error(f"AI Error: {e}")
         return None
 
-# =========================
-# SAFE JSON
-# =========================
-def safe_json(text):
-    try:
-        return json.loads(text)
-    except:
-        import re
-        match = re.search(r"\{.*\}", text, re.S)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                return None
-        return None
+async def generate_voice(text, lang='en'):
+    loop = asyncio.get_event_loop()
+    def create_audio():
+        clean = text.replace('*', '').replace('_', '')
+        tts = gTTS(text=clean, lang=lang)
+        audio_buffer = io.BytesIO()
+        tts.write_to_fp(audio_buffer)
+        audio_buffer.seek(0)
+        return audio_buffer
+    return await loop.run_in_executor(None, create_audio)
 
 # =========================
-# LOGIC
+# CORE ENGINE
 # =========================
 async def send_next_step(user_id):
     sess = user_sessions.get(user_id)
-    if not sess:
-        return
-    if sess.get("step", 0) >= 10:
-        await bot.send_message(user_id, f"🏁 Done! Score: {sess.get('score', 0)}/10")
+    if not sess: return
+
+    if sess.get('is_exam') and sess['step'] >= 10:
+        mistakes = ", ".join(sess.get('mistakes_words', [])) if sess.get('mistakes_words') else "None"
+        analysis = await ai_request(f"Mistakes: {mistakes}. Give tips in Russian.", "Teacher.", user_id=user_id)
+        if analysis:
+            await bot.send_message(user_id, f"🏆 Exam Finished!\nScore: {sess['score']}/10\n\n{analysis}")
         user_sessions.pop(user_id, None)
         return
-    await grammar_q(user_id, sess)
 
-async def grammar_q(user_id, sess):
-    raw = await ai_request(
-        "Create English grammar test (4 options). JSON: q, o, c",
-        "Return JSON only",
-        json_mode=True
-    )
-    data = safe_json(raw)
-    if not data:
-        await bot.send_message(user_id, "AI error, retrying...")
-        return
-    sess["correct"] = data["c"]
-    await bot.send_poll(
-        user_id,
-        data["q"],
-        data["o"][:4],
-        type="quiz",
-        correct_option_id=data["c"],
-        is_anonymous=False
-    )
+    q_type = random.choice(['vocab', 'grammar']) if sess.get('is_exam') else sess['type']
+    q_num_header = f"Question {sess['step'] + 1}/10\n" if sess.get('is_exam') else ""
+
+    db = SessionLocal()
+    try:
+        if q_type == 'vocab':
+            exclude = sess.get('used_items', [])
+            target = db.query(Vocab).filter(~Vocab.word.in_(exclude)).order_by(func.random()).first()
+            
+            if not target:
+                q_type = 'grammar'
+            else:
+                dist = db.query(Vocab).filter(Vocab.definition != target.definition).order_by(func.random()).limit(3).all()
+                options = list(set([target.definition] + [d.definition for d in dist]))
+                random.shuffle(options)
+
+                e_en = await ai_request(f"Explain word '{target.word}' for B2.", "Teacher.", user_id=user_id)
+                e_ru = await ai_request(f"Translate to Russian: {e_en}", "Translator.", user_id=user_id)
+
+                if not e_en or not e_ru: return
+
+                sess.setdefault('used_items', []).append(target.word)
+                sess.update({'correct_id': options.index(target.definition), 'current_word': target.word, 'explanation': e_en, 'explanation_ru': e_ru})
+                await bot.send_poll(user_id, f"{q_num_header}Task: Choose definition\nWord: '{target.word}'", options[:4], type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
+                return
+
+        # Grammar logic
+        prompt = "Create B2 grammar sentence with ____. JSON: {\"q\":\"...\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"...\",\"e_ru\":\"...\"}"
+        res_raw = await ai_request(prompt, "Teacher. JSON ONLY.", json_mode=True, user_id=user_id)
+        data = json.loads(res_raw)
+        sess.update({'correct_id': data['c'], 'explanation': data['e_en'], 'explanation_ru': data['e_ru'], 'current_word': 'Grammar'})
+        await bot.send_poll(user_id, f"{q_num_header}{data['q']}", data['o'][:4], type='quiz', correct_option_id=data['c'], is_anonymous=False)
+    
+    except Exception as e:
+        logging.error(f"Step error: {e}")
+        await send_next_step(user_id)
+    finally:
+        db.close()
+
+@dp.poll_answer()
+async def poll_ans(poll_answer: PollAnswer):
+    uid = poll_answer.user.id
+    if uid in user_sessions:
+        sess = user_sessions[uid]
+        if poll_answer.option_ids[0] == sess['correct_id']: 
+            sess['score'] += 1
+        else: 
+            sess.setdefault('mistakes_words', []).append(sess.get('current_word'))
+        
+        msg = f"💡 <b>Explanation:</b>\n{sess['explanation']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{sess['explanation_ru']}</tg-spoiler>"
+        try: await bot.send_message(uid, msg, parse_mode="HTML")
+        except: pass
+        
+        sess['step'] += 1
+        await asyncio.sleep(0.5)
+        await send_next_step(uid)
 
 # =========================
 # HANDLERS
 # =========================
 @dp.message(F.text == "/start")
 async def start(m: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Start test")]],
-        resize_keyboard=True
-    )
-    await m.answer("Ready 🚀", reply_markup=kb)
+    db = SessionLocal()
+    if not db.query(User).filter(User.user_id == m.from_user.id).first():
+        db.add(User(user_id=m.from_user.id))
+        db.commit()
+    db.close()
+    
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],
+        [KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],
+        [KeyboardButton(text="📊 My Progress")]
+    ], resize_keyboard=True)
+    await m.answer("🎯 English Coach connected to Supabase!", reply_markup=kb)
 
-@dp.message(F.text == "Start test")
-async def start_test(m: types.Message):
-    user_sessions[m.from_user.id] = {"step": 0, "score": 0}
+@dp.message(F.text == "📚 Vocabulary")
+async def v_q_start(m: types.Message):
+    user_sessions[m.from_user.id] = {'type':'vocab', 'score':0, 'step':0, 'is_exam': False, 'used_items': []}
     await send_next_step(m.from_user.id)
 
-@dp.poll_answer()
-async def handle_poll(p: PollAnswer):
-    uid = p.user.id
-    if uid not in user_sessions:
-        return
-    sess = user_sessions[uid]
-    if p.option_ids and p.option_ids[0] == sess.get("correct"):
-        sess["score"] += 1
-    sess["step"] += 1
-    await send_next_step(uid)
+@dp.message(F.document.mime_type == "application/pdf")
+async def pdf_h(m: types.Message):
+    st = await m.answer("⏳ Analyzing PDF with Supabase...")
+    try:
+        file = await bot.get_file(m.document.file_id)
+        content = await bot.download_file(file.file_path)
+        reader = PdfReader(io.BytesIO(content.read()))
+        text = "".join([p.extract_text() for p in reader.pages[:2]])
+        
+        res_raw = await ai_request(f"Extract 3 B2 terms from: {text[:2000]}", "JSON only: {\"items\":[{\"w\":\"word\",\"d\":\"def\"}]}", json_mode=True, user_id=m.from_user.id)
+        data = json.loads(res_raw)
+        
+        db = SessionLocal()
+        for i in data.get('items', []):
+            db.add(Vocab(word=i['w'], definition=i['d'], category='pdf', source=m.document.file_name))
+        db.commit()
+        db.close()
+        await st.edit_text(f"✅ Added {len(data.get('items', []))} terms to cloud storage.")
+    except Exception as e:
+        logging.error(e)
+        await st.edit_text("❌ PDF error.")
 
 # =========================
 # MAIN
 # =========================
 async def main():
-    # 1. Запускаем AI воркера
-    asyncio.create_task(ai_worker())
-    
-    # 2. Запускаем веб-сервер для Render (костыль для порта)
     asyncio.create_task(start_web_server())
-    
-    # 3. Запускаем опрос Telegram
-    logging.info("Starting bot polling...")
+    logging.info("Bot is starting with PostgreSQL support...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot stopped.")
+    asyncio.run(main())
