@@ -5,3 +5,5 @@ PyPDF2
 aiohttp>=3.13.0
 pydantic>=2.10.0
 python-dotenv
+sqlalchemy
+psycopg2-binary
