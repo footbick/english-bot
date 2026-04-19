@@ -14,7 +14,7 @@ from gtts import gTTS
 
 # Библиотеки для работы с PostgreSQL
 from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import func
 
