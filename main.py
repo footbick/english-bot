@@ -1,6 +1,6 @@
 import os, io, asyncio, random, json, logging
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer, BufferedInputFile
+from aiogram.types import *
 from aiohttp import web
 from PyPDF2 import PdfReader
 from groq import Groq
@@ -10,199 +10,223 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 # --- CONFIG ---
 logging.basicConfig(level=logging.INFO)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("No TELEGRAM_TOKEN")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 client = Groq(api_key=GROQ_API_KEY)
 user_sessions = {}
 
-# --- DB SETUP ---
+# --- DB ---
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = None
+SessionLocal = None
 
-class User(Base):
-    __tablename__ = "users"
-    user_id = Column(BigInteger, primary_key=True)
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        SessionLocal = sessionmaker(bind=engine)
+        logging.info("DB connected")
+    except Exception as e:
+        logging.error(e)
 
 class Vocab(Base):
     __tablename__ = "vocab"
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     word = Column(String)
     definition = Column(Text)
-    category = Column(String) 
-    source = Column(String)
+    category = Column(String)
 
-Base.metadata.create_all(bind=engine)
+if engine:
+    Base.metadata.create_all(bind=engine)
 
-# --- WEB SERVER ---
-async def handle(request): return web.Response(text="Bot Active")
-async def start_web_server():
+# --- WEB ---
+async def handle(request): return web.Response(text="OK")
+
+async def start_web():
     app = web.Application()
     app.router.add_get("/", handle)
-    runner = web.AppRunner(app); await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- AI TOOLS ---
-async def ai_request(prompt, system_msg, json_mode=False):
-    loop = asyncio.get_event_loop()
-    def call():
-        fmt = {"type": "json_object"} if json_mode else None
-        return client.chat.completions.create(
-            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile", response_format=fmt
-        ).choices[0].message.content
-    try: return await loop.run_in_executor(None, call)
-    except: return None
-
-async def generate_voice(text):
-    loop = asyncio.get_event_loop()
-    def create_audio():
-        tts = gTTS(text=text.replace('*', ''), lang='en')
-        buf = io.BytesIO(); tts.write_to_fp(buf); buf.seek(0); return buf
-    return await loop.run_in_executor(None, create_audio)
-
-# --- ENGINE ---
-async def send_next_step(user_id):
-    sess = user_sessions.get(user_id)
-    if not sess: return
-    db = SessionLocal()
+# --- AI ---
+async def ai_request(prompt, system="Teacher", json_mode=False):
     try:
-        header = f"📍 Question {sess['step'] + 1}/10\n\n" if sess.get('is_exam') else ""
-        if sess.get('is_exam') and sess['step'] >= 10:
-            user_sessions.pop(user_id, None); await bot.send_message(user_id, "🏆 Exam Finished!"); return
+        def call():
+            fmt = {"type": "json_object"} if json_mode else None
+            return client.chat.completions.create(
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                response_format=fmt
+            ).choices[0].message.content
+        return await asyncio.to_thread(call)
+    except Exception as e:
+        logging.error(e)
+        return None
 
-        q_type = random.choice(['vocab', 'grammar']) if sess.get('is_exam') else sess['type']
+# --- VOICE ---
+async def voice(text):
+    def make():
+        t = gTTS(text=text, lang="en")
+        b = io.BytesIO()
+        t.write_to_fp(b)
+        b.seek(0)
+        return b
+    return await asyncio.to_thread(make)
 
-        if q_type == 'vocab':
-            cat = sess.get('vocab_category')
-            query = db.query(Vocab)
-            if cat and cat != "all": query = query.filter(Vocab.category == cat)
-            target = query.order_by(func.random()).first()
-            
-            if not target: q_type = 'grammar'
-            else:
-                prompt = (f"Word: '{target.word}'. Create a B2 definition and 2 synonyms. "
-                          f"DO NOT use the word itself. Provide 3 wrong options. "
-                          f"JSON: {{\"def\":\"...\",\"syn\":\"...\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"...\",\"e_ru\":\"...\"}}")
-                res = await ai_request(prompt, "English Teacher. JSON ONLY.", json_mode=True)
-                data = json.loads(res)
-                options = data['o']; random.shuffle(options)
-                sess.update({'correct_id': options.index(target.word), 'explanation': data['e_en'], 'explanation_ru': data['e_ru'], 'current_word': target.word})
-                await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['def']}\n🔗 <b>Synonyms:</b> {data['syn']}", parse_mode="HTML")
-                await bot.send_poll(user_id, "Guess the word:", options[:4], type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
-                return
-
-        topic = sess.get('grammar_topic', 'general')
-        prompt = f"Topic: {topic}. B2 level. JSON: {{\"q\":\"... with ____\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"...\",\"e_ru\":\"...\"}}"
-        res = await ai_request(prompt, "Grammar Teacher. JSON ONLY.", json_mode=True)
-        data = json.loads(res)
-        sess.update({'correct_id': data['c'], 'explanation': data['e_en'], 'explanation_ru': data['e_ru']})
-        await bot.send_poll(user_id, f"{header}{data['q']}", data['o'][:4], type='quiz', correct_option_id=data['c'], is_anonymous=False)
-    finally: db.close()
-
-@dp.poll_answer()
-async def handle_poll(p: PollAnswer):
-    uid = p.user.id
-    if uid not in user_sessions: return
-    sess = user_sessions[uid]
-    await bot.send_message(uid, f"💡 <b>Explanation:</b>\n{sess['explanation']}\n\n🇷🇺 <b>RU:</b> <tg-spoiler>{sess['explanation_ru']}</tg-spoiler>", parse_mode="HTML")
-    sess['step'] += 1; await asyncio.sleep(1); await send_next_step(uid)
-
-# --- HANDLERS ---
+# --- START ---
 @dp.message(F.text == "/start")
-async def cmd_start(m: types.Message):
+async def start(m: types.Message):
     kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],
-        [KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],
-        [KeyboardButton(text="📊 My Progress")]
+        [KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar")],
+        [KeyboardButton(text="🎤 Speaking"), KeyboardButton(text="📊 My Progress")]
     ], resize_keyboard=True)
-    await m.answer("🎯 Coach Active!", reply_markup=kb)
+    await m.answer("Ready", reply_markup=kb)
 
+# --- VOCAB MENU ---
 @dp.message(F.text == "📚 Vocabulary")
-async def v_menu(m: types.Message):
+async def vocab_menu(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔡 Words", callback_data="voc_word"), InlineKeyboardButton(text="🗣 Phrases", callback_data="voc_phrase")],
-        [InlineKeyboardButton(text="🧪 Phrasal Verbs", callback_data="voc_phrasal_verb"), InlineKeyboardButton(text="📄 PDF Words", callback_data="voc_pdf")],
-        [InlineKeyboardButton(text="🔗 Collocations", callback_data="voc_collocation"), InlineKeyboardButton(text="🎭 Idioms", callback_data="voc_idiom")],
-        [InlineKeyboardButton(text="➕ Add New Words", callback_data="voc_add_help")],
-        [InlineKeyboardButton(text="🗑 View / Delete Words", callback_data="list_0")]
+        [InlineKeyboardButton(text="Words", callback_data="voc_word"),
+         InlineKeyboardButton(text="Phrases", callback_data="voc_phrase")],
+        [InlineKeyboardButton(text="Idioms", callback_data="voc_idiom")],
+        [InlineKeyboardButton(text="Delete Words", callback_data="list")]
     ])
-    await m.answer("Vocabulary Management:", reply_markup=kb)
-
-@dp.callback_query(F.data == "voc_add_help")
-async def v_add_help(cb: types.CallbackQuery):
-    await cb.message.answer("📝 Чтобы добавить слова, просто отправь их боту списком через запятую или каждое с новой строки.\n\nНапример:\n`Advantage, Challenge, Get over`")
-    await cb.answer()
+    await m.answer("Choose:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("voc_"))
-async def v_start(cb: types.CallbackQuery):
-    cat = cb.data.split("_")[1]
-    if cat == "add": return
-    user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': cat}
-    await cb.message.answer(f"Starting {cat.replace('_', ' ')}..."); await send_next_step(cb.from_user.id)
+async def vocab_start(cb: CallbackQuery):
+    cat = cb.data.replace("voc_", "")
+    user_sessions[cb.from_user.id] = {"cat": cat}
+    await send_word(cb.from_user.id)
 
-@dp.callback_query(F.data.startswith("list_"))
-async def list_words(cb: types.CallbackQuery):
-    off = int(cb.data.split('_')[1]); db = SessionLocal()
-    words = db.query(Vocab).order_by(Vocab.id.desc()).limit(10).offset(off).all(); db.close()
-    if not words: await cb.answer("No more words."); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+10}")])
-    await cb.message.edit_text("Tap to delete:", reply_markup=kb)
+async def send_word(uid):
+    if not SessionLocal: return
+    db = SessionLocal()
+    sess = user_sessions[uid]
+    word = db.query(Vocab).filter(Vocab.category == sess["cat"]).order_by(func.random()).first()
+    db.close()
+    if not word:
+        await bot.send_message(uid, "No words")
+        return
+
+    prompt = f"""
+Word: {word.word}
+Definition: {word.definition}
+
+Give:
+- definition
+- 3 similar wrong options
+
+JSON:
+{{"q":"...","o":["correct","w1","w2","w3"],"e":"explain"}}
+"""
+    res = await ai_request(prompt, json_mode=True)
+    if not res:
+        await bot.send_message(uid, "AI error")
+        return
+
+    data = json.loads(res)
+    opts = data["o"]
+    random.shuffle(opts)
+
+    await bot.send_poll(uid, data["q"], opts,
+                        type="quiz",
+                        correct_option_id=opts.index(word.word))
+
+# --- DELETE ---
+@dp.callback_query(F.data == "list")
+async def list_words(cb: CallbackQuery):
+    db = SessionLocal()
+    words = db.query(Vocab).limit(10).all()
+    db.close()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=w.word, callback_data=f"del_{w.id}")]
+        for w in words
+    ])
+    await cb.message.answer("Tap to delete", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("del_"))
-async def del_word(cb: types.CallbackQuery):
-    wid = int(cb.data.split('_')[1]); db = SessionLocal()
-    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close(); await list_words(cb)
+async def delete(cb: CallbackQuery):
+    wid = int(cb.data.split("_")[1])
+    db = SessionLocal()
+    db.query(Vocab).filter(Vocab.id == wid).delete()
+    db.commit()
+    db.close()
+    await cb.message.edit_text("Deleted")
 
-@dp.message(F.text == "⚙️ Grammar Test")
-async def g_menu(m: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Passive Voice", callback_data="gt_passive")],
-        [InlineKeyboardButton(text="❓ Conditionals", callback_data="gt_conditionals")],
-        [InlineKeyboardButton(text="🔗 Complex Object", callback_data="gt_complex")],
-        [InlineKeyboardButton(text="✨ Participle & Gerund", callback_data="gt_participle")],
-        [InlineKeyboardButton(text="📍 Prepositions", callback_data="gt_prepositions")],
-        [InlineKeyboardButton(text="🎲 Mixed Practice", callback_data="gt_general")]
-    ])
-    await m.answer("Choose topic:", reply_markup=kb)
+# --- PDF ---
+@dp.message(F.document)
+async def pdf(m: types.Message):
+    file = await bot.get_file(m.document.file_id)
+    f = await bot.download_file(file.file_path)
+    reader = PdfReader(f)
+    text = "".join([p.extract_text() or "" for p in reader.pages[:5]])
+    words = list(set(text.split()))[:20]
 
-@dp.callback_query(F.data.startswith("gt_"))
-async def g_start(cb: types.CallbackQuery):
-    topic = cb.data.split("_")[1]
-    user_sessions[cb.from_user.id] = {'type':'grammar', 'step':0, 'score':0, 'grammar_topic': topic}
-    await cb.message.answer(f"Practice: {topic.upper()}"); await send_next_step(cb.from_user.id)
-
-@dp.message(F.text == "🎤 Speaking Practice")
-async def spk_start(m: types.Message):
-    res = await ai_request("3 B2 topics. JSON: {\"topics\":[\"Title\"]}", "JSON ONLY.", json_mode=True)
-    topics = json.loads(res)['topics']
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"spk_{t[:20]}")] for t in topics])
-    await m.answer("Topics:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("spk_"))
-async def spk_selected(cb: types.CallbackQuery):
-    topic = cb.data[4:]; q = await ai_request(f"Ask about {topic}", "Teacher.")
-    await cb.message.answer(f"🗣 <b>{topic}</b>\n{q}", parse_mode="HTML")
-    v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
-
-@dp.message(F.text)
-async def manual_add(m: types.Message):
-    if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
-    words = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
     db = SessionLocal()
     for w in words:
-        res = await ai_request(f"Define '{w}' for B2.", "Short definition.")
-        if res: db.add(Vocab(word=w, definition=res, category='word', source='manual'))
-    db.commit(); db.close(); await m.answer(f"✅ Added {len(words)} items.")
+        db.add(Vocab(word=w, definition="from pdf", category="word"))
+    db.commit()
+    db.close()
 
+    await m.answer("PDF processed")
+
+# --- GRAMMAR ---
+@dp.message(F.text == "⚙️ Grammar")
+async def grammar(m: types.Message):
+    prompt = """
+Create B2 grammar question.
+English only.
+JSON:
+{"q":"...","o":["a","b","c","d"],"c":0,"e":"explanation"}
+"""
+    res = await ai_request(prompt, json_mode=True)
+    data = json.loads(res)
+
+    await m.answer_poll(data["q"], data["o"],
+                        type="quiz",
+                        correct_option_id=data["c"])
+
+    await m.answer(data["e"])
+
+# --- SPEAKING ---
+@dp.message(F.text == "🎤 Speaking")
+async def speaking(m: types.Message):
+    res = await ai_request("Give 1 short speaking question", "Examiner")
+    v = await voice(res)
+    await m.answer(res)
+    await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
+
+@dp.message(F.voice)
+async def voice_answer(m: types.Message):
+    await m.answer("Got your answer 👍")
+
+# --- PROGRESS ---
+@dp.message(F.text == "📊 My Progress")
+async def progress(m: types.Message):
+    if not SessionLocal:
+        await m.answer("No DB")
+        return
+    db = SessionLocal()
+    count = db.query(Vocab).count()
+    db.close()
+    await m.answer(f"Words in DB: {count}")
+
+# --- MAIN ---
 async def main():
-    asyncio.create_task(start_web_server()); await dp.start_polling(bot)
+    await start_web()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
