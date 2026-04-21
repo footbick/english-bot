@@ -7,7 +7,6 @@ from groq import Groq
 from gtts import gTTS
 from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text, func, desc, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-# Импортируем планировщик
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -47,18 +46,14 @@ def init_db():
         try: conn.execute(text("ALTER TABLE vocab ADD COLUMN IF NOT EXISTS user_id BIGINT")); conn.commit()
         except: pass
 
-# --- ЛОГИКА НАПОМИНАНИЙ ---
 async def send_reminder():
     db = SessionLocal()
     try:
-        # Получаем всех уникальных пользователей из базы
         users = db.query(User.user_id).all()
-        for user in users:
-            try:
-                await bot.send_message(user.user_id, "🔔 <b>Time for English!</b>\nПора уделить 5 минут практике. Выберите раздел ниже 👇")
+        for u in users:
+            try: await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nПора практиковаться!")
             except: pass
-    finally:
-        db.close()
+    finally: db.close()
 
 # --- 3. TOOLS ---
 async def ai_request(prompt, system_msg, json_mode=False):
@@ -100,21 +95,23 @@ async def send_next_step(user_id):
                 query = db.query(Vocab).filter(Vocab.user_id == user_id)
                 if cat != 'all' and not is_ex: query = query.filter(Vocab.category == cat)
                 target = query.filter(~Vocab.id.in_(sess.get('used', []))).order_by(func.random()).first()
-                
                 if not target:
                     if is_ex: q_type = 'grammar'
                     else: await bot.send_message(user_id, "⚠️ Category empty."); return
                 else:
                     sess.setdefault('used', []).append(target.id)
-                    res = await ai_request(f"Word: {target.word}. B2. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng explanation\",\"e_ru\":\"русское объяснение\"}}", "Teacher.", True)
+                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng\",\"e_ru\":\"рус\"}}", "Teacher.", True)
                     data = json.loads(res); opts = data['o']; random.shuffle(opts)
                     sess.update({'correct_id': opts.index(target.word), 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
                     await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode="HTML")
-                    await bot.send_poll(user_id, "Guess the word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
+                    await bot.send_poll(user_id, "Guess word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                     return
 
             topic = sess.get('grammar_topic', 'general')
-            res = await ai_request(f"Topic: {topic}. B2 Level. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"eng rule\",\"e_ru\":\"русский разбор\"}}", "Grammar Teacher.", True)
+            # Чтобы задания не повторялись, добавляем случайное число и инструкцию в промпт
+            seed = random.randint(1, 10000)
+            prompt = f"Topic: {topic}. B2 Level. UNIQUE task {seed}. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"eng\",\"e_ru\":\"рус\"}}"
+            res = await ai_request(prompt, "Grammar Teacher. NEVER repeat sentences.", True)
             data = json.loads(res)
             sess.update({'correct_id': data['c'], 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Разбор:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
             await bot.send_poll(user_id, f"{header}📝 Grammar: {topic}\n\n{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
@@ -180,9 +177,29 @@ async def g_start(cb: types.CallbackQuery):
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_start(m: types.Message):
-    st = await m.answer("⏳ Generating..."); q = await ai_request("Ask 1 short B2 question.", "Short question only.")
-    await st.delete(); await m.answer(f"🗣 <b>Question:</b>\n{q}", parse_mode="HTML")
+    st = await m.answer("⏳ Generating topic..."); q = await ai_request("Ask 1 short B2 question to start a conversation.", "Question only.")
+    await st.delete(); await m.answer(f"🗣 <b>Topic Started!</b>\n{q}", parse_mode="HTML")
+    user_sessions[m.from_user.id] = {'type': 'speaking', 'history': [q]}
     v = await generate_voice(q); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
+
+@dp.message(F.voice)
+async def handle_speaking_voice(m: types.Message):
+    if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking':
+        return
+    st = await m.answer("👂 Listening..."); file = await bot.get_file(m.voice.file_id)
+    content = await bot.download_file(file.file_path)
+    # Whisper Transcription
+    trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
+    await st.edit_text(f"💬 <b>You said:</b> {trans}", parse_mode="HTML")
+    
+    # AI Response
+    history = user_sessions[m.from_user.id].get('history', [])
+    prompt = f"Chat history: {history}. User said: {trans}. Reply briefly and ask a follow-up question."
+    resp = await ai_request(prompt, "English Teacher. Friendly conversation.")
+    history.append(trans); history.append(resp)
+    
+    await m.answer(f"🗣 {resp}")
+    v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
 @dp.message(F.text == "📊 My Progress")
 async def exam_mode(m: types.Message):
@@ -216,17 +233,10 @@ async def start_web_server():
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
 
 async def main():
-    init_db()
-    # Запуск веб-сервера
-    asyncio.create_task(start_web_server())
-    
-    # Инициализация планировщика
+    init_db(); asyncio.create_task(start_web_server())
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    # Добавляем задачу: 9:00, 12:00, 15:00, 18:00 МСК
     scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18', minute=0))
     scheduler.start()
-    
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
