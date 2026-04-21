@@ -100,7 +100,7 @@ async def send_next_step(user_id):
                     else: await bot.send_message(user_id, "⚠️ Category empty."); return
                 else:
                     sess.setdefault('used', []).append(target.id)
-                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng\",\"e_ru\":\"рус\"}}", "Teacher.", True)
+                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"detailed explanation\",\"e_ru\":\"подробный разбор\"}}", "Teacher.", True)
                     data = json.loads(res); opts = data['o']; random.shuffle(opts)
                     sess.update({'correct_id': opts.index(target.word), 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
                     await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode="HTML")
@@ -108,10 +108,10 @@ async def send_next_step(user_id):
                     return
 
             topic = sess.get('grammar_topic', 'general')
-            # Чтобы задания не повторялись, добавляем случайное число и инструкцию в промпт
             seed = random.randint(1, 10000)
-            prompt = f"Topic: {topic}. B2 Level. UNIQUE task {seed}. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"eng\",\"e_ru\":\"рус\"}}"
-            res = await ai_request(prompt, "Grammar Teacher. NEVER repeat sentences.", True)
+            # Усиленный промпт для объяснений
+            prompt = f"Topic: {topic}. B2 Level. UNIQUE task {seed}. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"Detailed English grammar rule explanation\",\"e_ru\":\"Подробный разбор правила на русском языке\"}}"
+            res = await ai_request(prompt, "Grammar Teacher. Provide deep explanations.", True)
             data = json.loads(res)
             sess.update({'correct_id': data['c'], 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Разбор:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
             await bot.send_poll(user_id, f"{header}📝 Grammar: {topic}\n\n{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
@@ -135,7 +135,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v5.5 Active!", reply_markup=kb)
+    await m.answer("🎯 English Coach v5.6 Ready!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -146,7 +146,7 @@ async def v_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("voc_"))
 async def v_start(cb: types.CallbackQuery):
     cat = cb.data.split("_")[1]
-    if cat == "add": await cb.message.answer("Send words (e.g. Apple, Banana)"); return
+    if cat == "add": await cb.message.answer("Send words/phrases (one per line or separated by commas)"); return
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': cat, 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
@@ -176,11 +176,21 @@ async def g_start(cb: types.CallbackQuery):
     await send_next_step(cb.from_user.id); await cb.answer()
 
 @dp.message(F.text == "🎤 Speaking Practice")
-async def spk_start(m: types.Message):
-    st = await m.answer("⏳ Generating topic..."); q = await ai_request("Ask 1 short B2 question to start a conversation.", "Question only.")
-    await st.delete(); await m.answer(f"🗣 <b>Topic Started!</b>\n{q}", parse_mode="HTML")
-    user_sessions[m.from_user.id] = {'type': 'speaking', 'history': [q]}
-    v = await generate_voice(q); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
+async def spk_menu(m: types.Message):
+    st = await m.answer("⏳ Generating topics...")
+    res = await ai_request("Suggest 5 catchy B2 discussion topics. JSON: {\"topics\":[\"T1\",\"T2\",\"T3\",\"T4\",\"T5\"]}", "JSON ONLY.", True)
+    topics = json.loads(res)['topics']
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"spk_start_{t[:20]}")] for t in topics])
+    await st.delete(); await m.answer("Choose a topic to discuss:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("spk_start_"))
+async def spk_init(cb: types.CallbackQuery):
+    topic = cb.data[10:]
+    q = await ai_request(f"Ask 1 short B2 question about {topic} to start conversation.", "Question only.")
+    user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
+    await cb.message.answer(f"🗣 <b>Topic: {topic}</b>\n{q}", parse_mode="HTML")
+    v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
+    await cb.answer()
 
 @dp.message(F.voice)
 async def handle_speaking_voice(m: types.Message):
@@ -188,14 +198,12 @@ async def handle_speaking_voice(m: types.Message):
         return
     st = await m.answer("👂 Listening..."); file = await bot.get_file(m.voice.file_id)
     content = await bot.download_file(file.file_path)
-    # Whisper Transcription
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
-    await st.edit_text(f"💬 <b>You said:</b> {trans}", parse_mode="HTML")
+    await st.edit_text(f"💬 <b>You:</b> {trans}", parse_mode="HTML")
     
-    # AI Response
     history = user_sessions[m.from_user.id].get('history', [])
-    prompt = f"Chat history: {history}. User said: {trans}. Reply briefly and ask a follow-up question."
-    resp = await ai_request(prompt, "English Teacher. Friendly conversation.")
+    prompt = f"History: {history}. User: {trans}. Reply briefly and ask a follow-up question."
+    resp = await ai_request(prompt, "English Teacher conversation.")
     history.append(trans); history.append(resp)
     
     await m.answer(f"🗣 {resp}")
@@ -219,14 +227,16 @@ async def handle_pdf(m: types.Message):
 @dp.message(F.text)
 async def manual_add(m: types.Message):
     if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
-    words = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
+    # Поддержка новой строки и запятых
+    raw_text = m.text.replace(',', '\n')
+    words = [i.strip() for i in raw_text.split('\n') if i.strip()]
+    
     db = SessionLocal()
     for w in words:
         res = await ai_request(f"Define '{w}'. JSON: {{\"d\":\"def\",\"c\":\"word/phrase/idiom\"}}", "JSON.", True)
         data = json.loads(res); db.add(Vocab(user_id=m.from_user.id, word=w, definition=data['d'], category=data['c']))
-    db.commit(); db.close(); await m.answer(f"✅ Added {len(words)} words.")
+    db.commit(); db.close(); await m.answer(f"✅ Added {len(words)} items.")
 
-# --- 6. RUN ---
 async def start_web_server():
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
