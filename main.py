@@ -22,14 +22,14 @@ client = Groq(api_key=GROQ_API_KEY)
 user_sessions = {}
 db_lock = asyncio.Lock()
 
-# --- 2. DB SETUP (Optimized for Supabase) ---
+# --- 2. DB SETUP (Усиленная стабильность для Render) ---
 Base = declarative_base()
 engine = create_engine(
     DATABASE_URL, 
-    pool_size=10, 
-    max_overflow=20, 
-    pool_pre_ping=True,
-    pool_recycle=300
+    pool_size=20,          # Увеличили пул соединений
+    max_overflow=10, 
+    pool_pre_ping=True,    # Проверка живое ли соединение перед использованием
+    pool_recycle=300       # Сброс старых соединений каждые 5 мин
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -57,25 +57,23 @@ async def send_reminder():
     try:
         users = db.query(User.user_id).all()
         for u in users:
-            try: await bot.send_message(u.user_id, "🔔 <b>Time for English Practice!</b>")
+            try: await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nПора практиковаться!")
             except: pass
     finally: db.close()
 
-# --- 3. TOOLS (Improved Stability) ---
+# --- 3. TOOLS (С увеличенными таймаутами) ---
 async def ai_request(prompt, system_msg, json_mode=False):
     loop = asyncio.get_event_loop()
-    for attempt in range(2): # 2 попытки если AI выдал ошибку
-        def call():
-            fmt = {"type": "json_object"} if json_mode else None
-            try:
-                return client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile", response_format=fmt, timeout=30
-                ).choices[0].message.content
-            except: return None
-        res = await loop.run_in_executor(None, call)
-        if res: return res
-    return None
+    def call():
+        fmt = {"type": "json_object"} if json_mode else None
+        try:
+            return client.chat.completions.create(
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile", response_format=fmt, 
+                timeout=45 # Увеличили до 45 секунд, чтобы не было Error Try Again
+            ).choices[0].message.content
+        except: return None
+    return await loop.run_in_executor(None, call)
 
 async def generate_voice(text):
     loop = asyncio.get_event_loop()
@@ -84,7 +82,7 @@ async def generate_voice(text):
         buf = io.BytesIO(); tts.write_to_fp(buf); buf.seek(0); return buf
     return await loop.run_in_executor(None, create_audio)
 
-# --- 4. CORE ENGINE ---
+# --- 4. ENGINE ---
 async def send_next_step(user_id):
     async with db_lock:
         sess = user_sessions.get(user_id)
@@ -103,42 +101,33 @@ async def send_next_step(user_id):
                 cat = sess.get('vocab_category', 'all')
                 query = db.query(Vocab).filter(Vocab.user_id == user_id)
                 if cat != 'all' and not is_ex: query = query.filter(Vocab.category == cat)
+                
+                # Оптимизированный выбор случайного слова
                 target = query.filter(~Vocab.id.in_(sess.get('used', []))).order_by(func.random()).first()
                 
                 if not target:
                     if is_ex: q_type = 'grammar'
                     else: 
-                        await bot.send_message(user_id, "⚠️ No words found in this category.")
+                        await bot.send_message(user_id, f"⚠️ Category '{cat}' is empty.")
                         return
                 else:
                     sess.setdefault('used', []).append(target.id)
-                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"detailed eng\",\"e_ru\":\"подробный рус\"}}", "Teacher.", True)
+                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng\",\"e_ru\":\"рус\"}}", "Teacher.", True)
                     data = json.loads(res); opts = data['o']; random.shuffle(opts)
                     sess.update({'correct_id': opts.index(target.word), 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
                     await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode="HTML")
                     await bot.send_poll(user_id, "Guess word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                     return
 
-            # GRAMMAR (Improved Topic Handling)
             topic = sess.get('grammar_topic', 'general')
-            instr = "Grammar Teacher. For Passive: use advanced forms. For Conditionals: use ALL types (0-3, mixed)."
-            res = await ai_request(f"Topic: {topic}. B2/C1. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"detailed rule\",\"e_ru\":\"подробный разбор\"}}", instr, True)
+            res = await ai_request(f"Topic: {topic}. B2/C1. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"eng\",\"e_ru\":\"рус\"}}", "Grammar Teacher.", True)
             data = json.loads(res)
             sess.update({'correct_id': data['c'], 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Разбор:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
             await bot.send_poll(user_id, f"{header}📝 Grammar: {topic}\n\n{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
         except Exception as e:
-            logging.error(f"Logic Error: {e}")
-            await bot.send_message(user_id, "⚠️ Connection glitch. Please tap the button again.")
+            logging.error(f"Error in send_next_step: {e}")
+            await bot.send_message(user_id, "⚠️ AI timeout. Click the button again to continue.")
         finally: db.close()
-
-@dp.poll_answer()
-async def handle_poll(p: PollAnswer):
-    uid = p.user.id
-    if uid not in user_sessions: return
-    sess = user_sessions[uid]
-    if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
-    await bot.send_message(uid, f"💡 <b>Explanation:</b>\n{sess.get('exp')}", parse_mode="HTML")
-    sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 # --- 5. HANDLERS ---
 @dp.message(F.text == "/start")
@@ -148,7 +137,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v5.9 Active!", reply_markup=kb)
+    await m.answer("🎯 English Coach v6.0 Ready!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -159,9 +148,7 @@ async def v_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("voc_"))
 async def v_start(cb: types.CallbackQuery):
     cat = cb.data.split("_")[1]
-    if cat == "add": 
-        await cb.message.answer("Send any amount of words/phrases (one per line).")
-        return
+    if cat == "add": await cb.message.answer("Send any amount of words (one per line)."); return
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': cat, 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
@@ -169,7 +156,7 @@ async def v_start(cb: types.CallbackQuery):
 async def list_words(cb: types.CallbackQuery):
     off = int(cb.data.split('_')[1]); db = SessionLocal()
     words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
-    if not words and off == 0: await cb.answer("Empty."); return
+    if not words and off == 0: await cb.answer("Dictionary empty."); return
     if not words: await cb.answer("End of list."); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
@@ -192,6 +179,15 @@ async def g_start(cb: types.CallbackQuery):
     topic = cb.data.split("_")[1]
     user_sessions[cb.from_user.id] = {'type':'grammar', 'step':0, 'score':0, 'grammar_topic': topic, 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
+
+@dp.poll_answer()
+async def handle_poll(p: PollAnswer):
+    uid = p.user.id
+    if uid not in user_sessions: return
+    sess = user_sessions[uid]
+    if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
+    await bot.send_message(uid, f"💡 <b>Explanation:</b>\n{sess.get('exp')}", parse_mode="HTML")
+    sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
@@ -217,7 +213,7 @@ async def handle_voice(m: types.Message):
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
     await st.edit_text(f"💬 <b>You:</b> {trans}", parse_mode="HTML")
     history = user_sessions[m.from_user.id].get('history', [])
-    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly (max 2 sentences) and ask question.", "Teacher.")
+    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly and ask question.", "Teacher.")
     history.append(trans); history.append(resp)
     await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
@@ -253,8 +249,13 @@ async def manual_add(m: types.Message):
             except: continue
     db.commit(); db.close(); await st.edit_text(f"✅ Success! Added {added} items.")
 
+async def start_web_server():
+    app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
+
 async def main():
-    init_db(); asyncio.create_task(web._run_app(web.Application(), port=10000))
+    init_db(); asyncio.create_task(start_web_server())
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18', minute=0))
     scheduler.start()
