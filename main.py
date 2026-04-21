@@ -7,6 +7,9 @@ from groq import Groq
 from gtts import gTTS
 from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text, func, desc, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+# Импортируем планировщик
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # --- 1. CONFIG ---
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +37,28 @@ class Vocab(Base):
     category = Column(String) 
     source = Column(String)
 
+class User(Base):
+    __tablename__ = "users"
+    user_id = Column(BigInteger, primary_key=True)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
         try: conn.execute(text("ALTER TABLE vocab ADD COLUMN IF NOT EXISTS user_id BIGINT")); conn.commit()
         except: pass
+
+# --- ЛОГИКА НАПОМИНАНИЙ ---
+async def send_reminder():
+    db = SessionLocal()
+    try:
+        # Получаем всех уникальных пользователей из базы
+        users = db.query(User.user_id).all()
+        for user in users:
+            try:
+                await bot.send_message(user.user_id, "🔔 <b>Time for English!</b>\nПора уделить 5 минут практике. Выберите раздел ниже 👇")
+            except: pass
+    finally:
+        db.close()
 
 # --- 3. TOOLS ---
 async def ai_request(prompt, system_msg, json_mode=False):
@@ -113,8 +133,12 @@ async def handle_poll(p: PollAnswer):
 # --- 5. HANDLERS ---
 @dp.message(F.text == "/start")
 async def cmd_start(m: types.Message):
+    db = SessionLocal()
+    if not db.query(User).filter(User.user_id == m.from_user.id).first():
+        db.add(User(user_id=m.from_user.id)); db.commit()
+    db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v5.3 Ready!", reply_markup=kb)
+    await m.answer("🎯 Coach v5.5 Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -185,13 +209,24 @@ async def manual_add(m: types.Message):
         data = json.loads(res); db.add(Vocab(user_id=m.from_user.id, word=w, definition=data['d'], category=data['c']))
     db.commit(); db.close(); await m.answer(f"✅ Added {len(words)} words.")
 
-async def main():
-    init_db(); asyncio.create_task(start_web_server())
-    await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
-
+# --- 6. RUN ---
 async def start_web_server():
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
+
+async def main():
+    init_db()
+    # Запуск веб-сервера
+    asyncio.create_task(start_web_server())
+    
+    # Инициализация планировщика
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    # Добавляем задачу: 9:00, 12:00, 15:00, 18:00 МСК
+    scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18', minute=0))
+    scheduler.start()
+    
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
