@@ -50,29 +50,27 @@ async def send_reminder():
         users = db.query(User.user_id).all()
         for u in users:
             try: 
-                # ФИКС 3: parse_mode для чистых уведомлений
                 await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nLet's do some practice.", parse_mode=ParseMode.HTML)
             except: pass
     finally: db.close()
 
-# --- 3. TOOLS (ФИКС 2: Умная модель + Тройной Retry) ---
+# --- 3. TOOLS (Model: 70b-versatile + Retry) ---
 async def ai_request(prompt, system_msg, json_mode=False):
     loop = asyncio.get_event_loop()
-    # Пытаемся достучаться до AI 3 раза прежде чем выдать ошибку
-    for attempt in range(3):
+    for attempt in range(3): # 3 попытки для исключения таймаутов
         def call():
             fmt = {"type": "json_object"} if json_mode else None
             try:
                 return client.chat.completions.create(
                     messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile", # Оставляем самую умную модель
+                    model="llama-3.3-70b-versatile", 
                     response_format=fmt, 
-                    timeout=60 # Ждем дольше (60 сек)
+                    timeout=60 # Увеличенный таймаут для умной модели
                 ).choices[0].message.content
             except: return None
         res = await loop.run_in_executor(None, call)
         if res: return res
-        await asyncio.sleep(2) # Пауза между попытками
+        await asyncio.sleep(1.5)
     return None
 
 async def generate_voice(text):
@@ -112,21 +110,20 @@ async def send_next_step(user_id):
                     data = json.loads(res); opts = data['o']; random.shuffle(opts)
                     sess.update({'correct_id': opts.index(target.word), 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
                     await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode=ParseMode.HTML)
-                    await bot.poll = await bot.send_poll(user_id, "Guess word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
+                    await bot.send_poll(user_id, "Guess word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                     return
 
-            # ФИКС 1: Промпт для безошибочной грамматики и полноценного разбора
             topic = sess.get('grammar_topic', 'general')
-            sys_msg = "You are a PhD English Professor. Ensure grammar logic is 100% correct. Explanation MUST be detailed (2 sentences minimum)."
-            res = await ai_request(f"Topic: {topic}. B2/C1 level. JSON: {{\"q\":\"sentence with ____ blank\",\"o\":[\"correct\",\"w1\",\"w2\",\"w3\"],\"c\":0,\"e_en\":\"detailed eng rule\",\"e_ru\":\"подробный разбор на русском\"}}", sys_msg, True)
+            sys_instr = "You are a PhD English Professor. Ensure grammar logic is 100% correct. Explanation MUST be detailed (2-3 sentences)."
+            res = await ai_request(f"Topic: {topic}. UNIQUE test. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"correct\",\"w1\",\"w2\",\"w3\"],\"c\":0,\"e_en\":\"detailed eng rule\",\"e_ru\":\"подробный разбор\"}}", sys_instr, True)
             data = json.loads(res)
             sess.update({'correct_id': data['c'], 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Разбор:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
             if header: await bot.send_message(user_id, header, parse_mode=ParseMode.HTML)
             await bot.send_poll(user_id, f"📝 Grammar: {topic}\n\n{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
-        except: await bot.send_message(user_id, "⚠️ AI is taking too long. Please try one more time.")
+        except: await bot.send_message(user_id, "⚠️ AI timeout. Click the button again.")
         finally: db.close()
 
-@dp.poll_poll_answer()
+@dp.poll_answer()
 async def handle_poll(p: PollAnswer):
     uid = p.user.id
     if uid not in user_sessions: return
@@ -143,7 +140,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v6.4 Final Ready!", reply_markup=kb)
+    await m.answer("🎯 Coach v6.5 Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -154,7 +151,7 @@ async def v_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("voc_"))
 async def v_start(cb: types.CallbackQuery):
     cat = cb.data.split("_")[1]
-    if cat == "add": await cb.message.answer("Send words (one per line)."); return
+    if cat == "add": await cb.message.answer("Send any amount of words (one per line)."); return
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': cat, 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
@@ -196,7 +193,7 @@ async def manual_add(m: types.Message):
     lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
     st = await m.answer(f"⏳ Processing {len(lines)} items..."); db = SessionLocal(); added = 0
     for w in lines:
-        prompt = f"Define '{w}'. Analyze: verb+prep->'phrasal_verb', 1w->'word', 2w+->'phrase'. JSON: {{\"d\":\"def\", \"c\":\"cat\"}}"
+        prompt = f"Define '{w}'. JSON: {{\"d\":\"def\", \"c\":\"word/phrase/phrasal_verb/idiom\"}}"
         res = await ai_request(prompt, "Vocab Teacher.", True)
         if res:
             try:
