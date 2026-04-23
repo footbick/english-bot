@@ -1,6 +1,7 @@
 import os, io, asyncio, random, json, logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer, BufferedInputFile
+from aiogram.enums import ParseMode
 from aiohttp import web
 from PyPDF2 import PdfReader
 from groq import Groq
@@ -24,7 +25,7 @@ db_lock = asyncio.Lock()
 
 # --- 2. DB SETUP ---
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=5, pool_pre_ping=True, pool_recycle=300)
+engine = create_engine(DATABASE_URL, pool_size=15, max_overflow=10, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Vocab(Base):
@@ -48,25 +49,25 @@ async def send_reminder():
     try:
         users = db.query(User.user_id).all()
         for u in users:
-            try: await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nПора сделать пару тестов.")
+            try: 
+                # ФИКС 3: Добавлен parse_mode для чистых уведомлений
+                await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nПора сделать пару тестов.", parse_mode=ParseMode.HTML)
             except: pass
     finally: db.close()
 
-# --- 3. TOOLS ---
-async def ai_request(prompt, system_msg, json_mode=False):
+# --- 3. TOOLS (ФИКС 2: Быстрая модель для исключения Timeout) ---
+async def ai_request(prompt, system_msg, json_mode=False, use_fast_model=True):
+    model = "llama-3.1-8b-instant" if use_fast_model else "llama-3.3-70b-versatile"
     loop = asyncio.get_event_loop()
-    for _ in range(2):
-        def call():
-            fmt = {"type": "json_object"} if json_mode else None
-            try:
-                return client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile", response_format=fmt, timeout=40
-                ).choices[0].message.content
-            except: return None
-        res = await loop.run_in_executor(None, call)
-        if res: return res
-    return None
+    def call():
+        fmt = {"type": "json_object"} if json_mode else None
+        try:
+            return client.chat.completions.create(
+                messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+                model=model, response_format=fmt, timeout=50
+            ).choices[0].message.content
+        except: return None
+    return await loop.run_in_executor(None, call)
 
 async def generate_voice(text):
     loop = asyncio.get_event_loop()
@@ -84,7 +85,7 @@ async def send_next_step(user_id):
         try:
             is_ex = sess.get('is_exam', False)
             if is_ex and sess['step'] >= 10:
-                await bot.send_message(user_id, f"🏆 <b>Exam Result: {sess['score']}/10</b>", parse_mode="HTML")
+                await bot.send_message(user_id, f"🏆 <b>Exam Result: {sess['score']}/10</b>", parse_mode=ParseMode.HTML)
                 user_sessions.pop(user_id, None); return
 
             header = f"<b>Question {sess['step'] + 1}/10</b>\n\n" if is_ex else ""
@@ -102,20 +103,22 @@ async def send_next_step(user_id):
                 
                 if target:
                     sess.setdefault('used', []).append(target.id)
-                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng explanation\",\"e_ru\":\"русский перевод\"}}", "Teacher.", True)
+                    res = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"e_en\":\"eng\",\"e_ru\":\"рус\"}}", "Teacher.", True)
                     data = json.loads(res); opts = data['o']; random.shuffle(opts)
                     sess.update({'correct_id': opts.index(target.word), 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Перевод:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
-                    await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode="HTML")
+                    await bot.send_message(user_id, f"{header}📖 <b>Definition:</b> {data['d']}\n🔗 <b>Synonyms:</b> {data['s']}", parse_mode=ParseMode.HTML)
                     await bot.send_poll(user_id, "Guess word:", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                     return
 
+            # ФИКС 1: Усиленная инструкция для исключения ошибок в правилах
             topic = sess.get('grammar_topic', 'general')
-            res = await ai_request(f"Topic: {topic}. UNIQUE. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"eng rule\",\"e_ru\":\"русский разбор\"}}", "Grammar Teacher.", True)
+            sys_msg = "You are a Perfect Grammar Teacher. Strictly follow English rules. Double-check the correct option index 'c'."
+            res = await ai_request(f"Topic: {topic}. UNIQUE test. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e_en\":\"rule\",\"e_ru\":\"разбор\"}}", sys_msg, True)
             data = json.loads(res)
             sess.update({'correct_id': data['c'], 'exp': f"{data['e_en']}\n\n🇷🇺 <b>Разбор:</b> <tg-spoiler>{data['e_ru']}</tg-spoiler>"})
-            await bot.send_message(user_id, header, parse_mode="HTML") if header else None
+            if header: await bot.send_message(user_id, header, parse_mode=ParseMode.HTML)
             await bot.send_poll(user_id, f"Grammar: {topic}\n\n{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
-        except: await bot.send_message(user_id, "⚠️ AI timeout. Click again.")
+        except: await bot.send_message(user_id, "⚠️ AI was slow. Please tap the button again.")
         finally: db.close()
 
 @dp.poll_answer()
@@ -124,7 +127,7 @@ async def handle_poll(p: PollAnswer):
     if uid not in user_sessions: return
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
-    await bot.send_message(uid, f"💡 <b>Explanation:</b>\n{sess.get('exp')}", parse_mode="HTML")
+    await bot.send_message(uid, f"💡 <b>Explanation:</b>\n{sess.get('exp')}", parse_mode=ParseMode.HTML)
     sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 # --- 5. HANDLERS ---
@@ -135,7 +138,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v6.4 Ready!", reply_markup=kb)
+    await m.answer("🎯 Coach v6.4 Final Fix Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -154,8 +157,7 @@ async def v_start(cb: types.CallbackQuery):
 async def list_words(cb: types.CallbackQuery):
     off = int(cb.data.split('_')[1]); db = SessionLocal()
     words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
-    if not words and off == 0: await cb.answer("Dictionary empty."); return
-    if not words: await cb.answer("End of list."); return
+    if not words and off == 0: await cb.answer("Empty."); return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
     try: await cb.message.edit_text("Manage Vocabulary:", reply_markup=kb)
@@ -187,9 +189,9 @@ async def spk_menu(m: types.Message):
 
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
-    topic = cb.data[7:]; q = await ai_request(f"Start conversation about {topic}. Max 2 sentences.", "B2 Teacher.")
+    topic = cb.data[7:]; q = await ai_request(f"Conversation about {topic}. Max 2 sentences.", "Teacher.", False, False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
-    await cb.message.answer(f"🗣 <b>Topic: {topic}</b>\n{q}", parse_mode="HTML")
+    await cb.message.answer(f"🗣 <b>Topic: {topic}</b>\n{q}", parse_mode=ParseMode.HTML)
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
     await cb.answer()
 
@@ -199,9 +201,9 @@ async def handle_voice(m: types.Message):
     st = await m.answer("👂 Listening..."); file = await bot.get_file(m.voice.file_id)
     content = await bot.download_file(file.file_path)
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
-    await st.edit_text(f"💬 <b>You:</b> {trans}", parse_mode="HTML")
+    await st.edit_text(f"💬 <b>You:</b> {trans}", parse_mode=ParseMode.HTML)
     history = user_sessions[m.from_user.id].get('history', [])
-    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly and ask question.", "Teacher.")
+    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly.", "Teacher.", False, False)
     history.append(trans); history.append(resp)
     await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
@@ -209,14 +211,14 @@ async def handle_voice(m: types.Message):
 @dp.message(F.text == "📊 My Progress")
 async def exam_mode(m: types.Message):
     user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': []}
-    await m.answer("🏆 <b>Starting Exam (10 Questions)</b>", parse_mode="HTML"); await send_next_step(m.from_user.id)
+    await m.answer("🏆 <b>Starting Exam (10 Questions)</b>", parse_mode=ParseMode.HTML); await send_next_step(m.from_user.id)
 
 @dp.message(F.document)
 async def handle_pdf(m: types.Message):
     st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
     content = await bot.download_file(file.file_path); reader = PdfReader(io.BytesIO(content.read()))
     text = "".join([p.extract_text() for p in reader.pages[:2]])
-    res = await ai_request(f"Extract 8 items. Analyze: verb+prep->'phrasal_verb', 1w->'word', 2w+->'phrase'. JSON: {{\"items\":[{{\"w\":\"word\",\"d\":\"def\",\"c\":\"cat\"}}]}}. Text: {text[:1500]}", "JSON ONLY.", True)
+    res = await ai_request(f"Extract 8 items. JSON: {{\"items\":[{{\"w\":\"word\",\"d\":\"def\",\"c\":\"cat\"}}]}}. Text: {text[:1500]}", "JSON.", True)
     items = json.loads(res).get('items', []); db = SessionLocal()
     for i in items: db.add(Vocab(user_id=m.from_user.id, word=i['w'], definition=i['d'], category=i.get('c', 'word')))
     db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items.")
@@ -227,19 +229,15 @@ async def manual_add(m: types.Message):
     lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
     st = await m.answer(f"⏳ Processing {len(lines)} items..."); db = SessionLocal(); added = 0
     for w in lines:
-        # Улучшенное распределение
-        prompt = (f"Define '{w}'. Categorize: if verb+preposition (e.g. look for) -> 'phrasal_verb', "
-                  f"if 1 word -> 'word', if 2+ words -> 'phrase', if idiom -> 'idiom'. "
-                  f"JSON: {{\"d\":\"def\", \"c\":\"cat\"}}")
-        res = await ai_request(prompt, "Vocab Classifier.", True)
+        prompt = f"Define '{w}'. Analyze cat: 1w->'word', 2w+->'phrase', verb+prep->'phrasal_verb'. JSON: {{\"d\":\"def\", \"c\":\"cat\"}}"
+        res = await ai_request(prompt, "Vocab Teacher.", True)
         if res:
             try:
-                data = json.loads(res)
-                db.add(Vocab(user_id=m.from_user.id, word=w, definition=data['d'], category=data['c']))
+                data = json.loads(res); db.add(Vocab(user_id=m.from_user.id, word=w, definition=data['d'], category=data['c']))
                 added += 1
                 if added % 5 == 0: await st.edit_text(f"⏳ Progress: {added}/{len(lines)}...")
+                await asyncio.sleep(0.05) # ФИКС: Не дает Render оборвать соединение
             except: continue
-        await asyncio.sleep(0.1) # Пауза для стабильности
     db.commit(); db.close(); await st.edit_text(f"✅ Success! Added {added} items.")
 
 async def start_web_server():
