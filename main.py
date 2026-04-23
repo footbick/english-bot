@@ -56,11 +56,13 @@ async def ai_request(prompt, system_msg, json_mode=False):
     for attempt in range(2):
         def call():
             try:
+                # ФИКС: Разрешаем любые эмодзи, но запрещаем HTML
+                instr = system_msg + " MANDATORY: You can use any emojis. But NO HTML tags (<b>, <i>, etc). NO labels like 'Definition:', 'Rule:', 'Explanation:'."
                 res = client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: Return only plain text values in JSON. NO HTML, NO labels like 'Definition:'."}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": instr}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
                     response_format={"type": "json_object"} if json_mode else None,
-                    timeout=45
+                    timeout=50
                 ).choices[0].message.content
                 return json.loads(clean_json(res)) if json_mode else res
             except: return None
@@ -75,7 +77,7 @@ async def generate_voice(text):
         buf = io.BytesIO(); tts.write_to_fp(buf); buf.seek(0); return buf
     return await loop.run_in_executor(None, create_audio)
 
-# --- 4. ENGINE (The Clean Logic) ---
+# --- 4. ENGINE ---
 async def send_next_step(user_id):
     sess = user_sessions.get(user_id)
     if not sess: return
@@ -98,18 +100,18 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                data = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"definition\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"Russian translation\"}}", "Expert Teacher.", True)
+                data = await ai_request(f"Word: {target.word}", "Expert Teacher. Give: d (definition), o (4 options with word), ru (Russian translation).", True)
                 opts = data.get('o', [])
-                if target.word not in opts: opts[0] = target.word
+                if target.word not in opts: opts = [target.word, "option2", "option3", "option4"]
                 random.shuffle(opts)
                 
-                # Чистый вывод со спойлером
-                sess.update({'correct_id': opts.index(target.word), 'exp': f"<b>{target.word}</b>\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
+                # Сохраняем объяснение (теперь без жесткой лампочки в коде)
+                sess.update({'correct_id': opts.index(target.word), 'exp': f"<b>{target.word}</b>\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', 'перевод')}</tg-spoiler>"})
                 await bot.send_poll(user_id, data['d'], opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
-        topic = "Mixed Grammar B2-C1" if is_ex else sess.get('grammar_topic', 'general')
-        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"correct\",\"w1\",\"w2\",\"w3\"],\"c\":0,\"e\":\"Eng rule\",\"ru\":\"Rus rule\"}}", "Grammar Professor.", True)
+        topic = "B2 Mixed English Grammar" if is_ex else sess.get('grammar_topic', 'general')
+        data = await ai_request(f"Topic: {topic}", "PhD Teacher. Give: q (question with ____), o (4 options), c (correct index), e (Eng rule), ru (Rus rule).", True)
         
         sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
         if header: await bot.send_message(user_id, header)
@@ -120,12 +122,13 @@ async def send_next_step(user_id):
     finally: db.close()
 
 @dp.poll_answer()
-async def handle_poll(p: PollAnswer):
+async def handle_poll_answer(p: PollAnswer):
     uid = p.user.id
     if uid not in user_sessions: return
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
-    await bot.send_message(uid, f"💡 {sess.get('exp')}")
+    # Выводим объяснение как есть (AI сам добавит эмодзи)
+    await bot.send_message(uid, sess.get('exp'))
     sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 # --- 5. HANDLERS ---
@@ -136,7 +139,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v8.6 Active!", reply_markup=kb)
+    await m.answer("🎯 Coach v8.9 Ready!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -154,6 +157,41 @@ async def v_start(cb: types.CallbackQuery):
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': 'all', 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
+@dp.message(F.text)
+async def manual_add(m: types.Message):
+    if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
+    lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
+    st = await m.answer(f"⏳ Processing {len(lines)} items...")
+    db = SessionLocal(); added = 0
+    for w in lines:
+        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
+        data = await ai_request(f"Define '{w}'", "Teacher. Give: d (definition).", True)
+        if data:
+            db.add(Vocab(user_id=m.from_user.id, word=w, definition=data['d'], category="all"))
+            added += 1
+            if added % 5 == 0: await st.edit_text(f"⏳ Progress: {added}/{len(lines)}...")
+    db.commit(); db.close()
+    await st.edit_text(f"✅ Added/Updated {added} items.")
+
+@dp.callback_query(F.data.startswith("list_"))
+async def list_words(cb: types.CallbackQuery):
+    off = int(cb.data.split('_')[1]); db = SessionLocal()
+    words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
+    if not words and off == 0: await cb.answer("Empty."); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
+    if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
+    if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
+    # ОБНОВЛЕНИЕ ТЕКСТА НА МЕСТЕ
+    try: await cb.message.edit_text("Tap to delete:", reply_markup=kb)
+    except: pass
+
+@dp.callback_query(F.data.startswith("del_"))
+async def del_word(cb: types.CallbackQuery):
+    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
+    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
+    await cb.answer("Deleted.")
+    await list_words(cb)
+
 @dp.message(F.text == "⚙️ Grammar Test")
 async def g_menu(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Passive Voice", callback_data="gt_passive"), InlineKeyboardButton(text="❓ Conditionals", callback_data="gt_conditionals")],[InlineKeyboardButton(text="🔗 Complex Object", callback_data="gt_complex"), InlineKeyboardButton(text="✨ Participle", callback_data="gt_participle")],[InlineKeyboardButton(text="📍 Prepositions", callback_data="gt_prepositions"), InlineKeyboardButton(text="🎲 Mixed Practice", callback_data="gt_general")]])
@@ -168,54 +206,19 @@ async def g_start(cb: types.CallbackQuery):
 @dp.message(F.text == "📊 My Progress")
 async def exam_mode(m: types.Message):
     user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': []}
-    await m.answer("🏆 <b>Starting Exam (Mixed Vocab & Grammar)</b>"); await send_next_step(m.from_user.id)
-
-@dp.message(F.text)
-async def manual_add(m: types.Message):
-    if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
-    lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
-    st = await m.answer(f"⏳ Processing {len(lines)} items...")
-    db = SessionLocal(); added = 0
-    for w in lines:
-        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
-        data = await ai_request(f"Define '{w}'. JSON: {{\"d\":\"def\"}}", "Vocab Teacher.", True)
-        if data:
-            db.add(Vocab(user_id=m.from_user.id, word=w, definition=data.get('d'), category="all"))
-            added += 1
-            if added % 5 == 0: await st.edit_text(f"⏳ Progress: {added}/{len(lines)}...")
-    db.commit(); db.close()
-    await st.edit_text(f"✅ Added/Updated {added} items.")
-
-@dp.callback_query(F.data.startswith("list_"))
-async def list_words(cb: types.CallbackQuery):
-    off = int(cb.data.split('_')[1]); db = SessionLocal()
-    words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
-    if not words and off == 0: await cb.answer("Empty."); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
-    if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
-    if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
-    try: await cb.message.edit_text("Tap to delete:", reply_markup=kb)
-    except: pass
-
-@dp.callback_query(F.data.startswith("del_"))
-async def del_word(cb: types.CallbackQuery):
-    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
-    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
-    await cb.answer("Deleted.")
-    # ОБНОВЛЕНИЕ СПИСКА НА МЕСТЕ
-    await list_words(cb)
+    await m.answer("🏆 <b>Starting Exam (Mixed Mode)</b>"); await send_next_step(m.from_user.id)
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
     st = await m.answer("⏳ Generating topics...")
-    res = await ai_request("5 catchy topics. JSON: {\"topics\":[\"T1\",\"T2\",\"T3\",\"T4\",\"T5\"]}", "JSON ONLY.", True)
+    res = await ai_request("5 catchy topics", "Teacher. JSON: {\"topics\":[\"T1\",\"T2\",\"T3\",\"T4\",\"T5\"]}", True)
     topics = res.get('topics', [])
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"spk_st_{t[:20]}")] for t in topics])
     await st.delete(); await m.answer("Pick a topic:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
-    topic = cb.data[7:]; q = await ai_request(f"Start conversation about {topic}. Max 2 sentences.", "Teacher.")
+    topic = cb.data[7:]; q = await ai_request(f"Conversation: {topic}", "Teacher. Ask 1 question.", False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 <b>Topic: {topic}</b>\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
@@ -229,7 +232,7 @@ async def handle_voice(m: types.Message):
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
     await st.edit_text(f"💬 <b>You:</b> {trans}")
     history = user_sessions[m.from_user.id].get('history', [])
-    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly.", "Teacher.")
+    resp = await ai_request(f"History: {history}. User: {trans}", "Teacher. Reply briefly.", False)
     history.append(trans); history.append(resp)
     await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
@@ -242,8 +245,17 @@ async def start_web_server():
 async def main():
     init_db(); asyncio.create_task(start_web_server())
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(lambda: asyncio.create_task(send_reminder()), CronTrigger(hour='9,12,15,18', minute=0))
+    scheduler.add_job(lambda: asyncio.create_task(send_reminder_job()), CronTrigger(hour='9,12,15,18', minute=0))
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
+
+async def send_reminder_job():
+    db = SessionLocal()
+    try:
+        users = db.query(User.user_id).all()
+        for u in users:
+            try: await bot.send_message(u.user_id, "🔔 <b>Time for English!</b>\nLet's do some practice.")
+            except: pass
+    finally: db.close()
 
 if __name__ == "__main__": asyncio.run(main())
