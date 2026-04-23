@@ -44,7 +44,7 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. TOOLS ---
+# --- 3. CORE TOOLS ---
 def clean_json(text):
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -53,12 +53,11 @@ def clean_json(text):
 
 async def ai_request(prompt, system_msg, json_mode=False):
     loop = asyncio.get_event_loop()
-    # Две попытки для исключения таймаутов
     for attempt in range(2):
         def call():
             try:
                 res = client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: NO HTML tags, NO labels like 'Definition:'. PLAIN TEXT."}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: Return only plain text values in JSON. NO HTML, NO labels like 'Definition:'."}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
                     response_format={"type": "json_object"} if json_mode else None,
                     timeout=45
@@ -76,7 +75,7 @@ async def generate_voice(text):
         buf = io.BytesIO(); tts.write_to_fp(buf); buf.seek(0); return buf
     return await loop.run_in_executor(None, create_audio)
 
-# --- 4. ENGINE ---
+# --- 4. ENGINE (The Clean Logic) ---
 async def send_next_step(user_id):
     sess = user_sessions.get(user_id)
     if not sess: return
@@ -95,32 +94,29 @@ async def send_next_step(user_id):
             target = query.filter(~Vocab.id.in_(sess.get('used', []))).order_by(func.random()).first()
             if not target:
                 if is_ex: q_type = 'grammar'
-                else: await bot.send_message(user_id, "⚠️ Your dictionary is empty."); return
+                else: await bot.send_message(user_id, "⚠️ Dictionary empty."); return
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                data = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"def\",\"s\":\"syn\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"перевод\"}}", "Expert English Teacher.", True)
-                if not data: raise Exception("AI Fail")
-                
+                data = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"definition\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"Russian translation\"}}", "Expert Teacher.", True)
                 opts = data.get('o', [])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
                 
-                # Чистый вывод без дублирующих слов-меток
-                sess.update({'correct_id': opts.index(target.word), 'exp': f"<b>{target.word}</b>\n{data['d']}\n\n🇷🇺 {data['ru']}"})
+                # Чистый вывод со спойлером
+                sess.update({'correct_id': opts.index(target.word), 'exp': f"<b>{target.word}</b>\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
                 await bot.send_poll(user_id, data['d'], opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
         topic = "Mixed Grammar B2-C1" if is_ex else sess.get('grammar_topic', 'general')
-        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"detailed rule\"}}", "Grammar PhD Teacher.", True)
-        if not data: raise Exception("AI Fail")
+        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"correct\",\"w1\",\"w2\",\"w3\"],\"c\":0,\"e\":\"Eng rule\",\"ru\":\"Rus rule\"}}", "Grammar Professor.", True)
         
-        sess.update({'correct_id': data['c'], 'exp': data['e']})
+        sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
         if header: await bot.send_message(user_id, header)
         await bot.send_poll(user_id, data['q'], data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
 
     except:
-        await bot.send_message(user_id, "⚠️ AI timeout. Click the button again.")
+        await bot.send_message(user_id, "⚠️ AI timeout. Click again.")
     finally: db.close()
 
 @dp.poll_answer()
@@ -140,14 +136,13 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v8.5 Ready!", reply_markup=kb)
+    await m.answer("🎯 Coach v8.6 Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
     db = SessionLocal(); count = db.query(Vocab).filter(Vocab.user_id == m.from_user.id).count(); db.close()
-    # ФИКС: Меню из 3 пунктов как на скриншоте
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔤 Start Learning", callback_data="voc_all")],
+        [InlineKeyboardButton(text="🔡 Start Learning", callback_data="voc_all")],
         [InlineKeyboardButton(text="➕ Add New", callback_data="voc_add"), InlineKeyboardButton(text="🗑 Delete", callback_data="list_0")]
     ])
     await m.answer(f"Your Vocabulary ({count} items):", reply_markup=kb)
@@ -169,6 +164,46 @@ async def g_start(cb: types.CallbackQuery):
     topic = cb.data.split("_")[1]
     user_sessions[cb.from_user.id] = {'type':'grammar', 'step':0, 'score':0, 'grammar_topic': topic, 'used': []}
     await send_next_step(cb.from_user.id); await cb.answer()
+
+@dp.message(F.text == "📊 My Progress")
+async def exam_mode(m: types.Message):
+    user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': []}
+    await m.answer("🏆 <b>Starting Exam (Mixed Vocab & Grammar)</b>"); await send_next_step(m.from_user.id)
+
+@dp.message(F.text)
+async def manual_add(m: types.Message):
+    if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
+    lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
+    st = await m.answer(f"⏳ Processing {len(lines)} items...")
+    db = SessionLocal(); added = 0
+    for w in lines:
+        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
+        data = await ai_request(f"Define '{w}'. JSON: {{\"d\":\"def\"}}", "Vocab Teacher.", True)
+        if data:
+            db.add(Vocab(user_id=m.from_user.id, word=w, definition=data.get('d'), category="all"))
+            added += 1
+            if added % 5 == 0: await st.edit_text(f"⏳ Progress: {added}/{len(lines)}...")
+    db.commit(); db.close()
+    await st.edit_text(f"✅ Added/Updated {added} items.")
+
+@dp.callback_query(F.data.startswith("list_"))
+async def list_words(cb: types.CallbackQuery):
+    off = int(cb.data.split('_')[1]); db = SessionLocal()
+    words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
+    if not words and off == 0: await cb.answer("Empty."); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
+    if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
+    if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
+    try: await cb.message.edit_text("Tap to delete:", reply_markup=kb)
+    except: pass
+
+@dp.callback_query(F.data.startswith("del_"))
+async def del_word(cb: types.CallbackQuery):
+    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
+    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
+    await cb.answer("Deleted.")
+    # ОБНОВЛЕНИЕ СПИСКА НА МЕСТЕ
+    await list_words(cb)
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
@@ -198,48 +233,6 @@ async def handle_voice(m: types.Message):
     history.append(trans); history.append(resp)
     await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
-
-@dp.message(F.text == "📊 My Progress")
-async def exam_mode(m: types.Message):
-    user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': []}
-    await m.answer("🏆 <b>Starting Exam (Mixed Vocab & All Grammar)</b>"); await send_next_step(m.from_user.id)
-
-@dp.message(F.text)
-async def manual_add(m: types.Message):
-    if m.text.startswith("/") or m.text in ["📁 Upload PDF", "🎤 Speaking Practice", "📚 Vocabulary", "⚙️ Grammar Test", "📊 My Progress"]: return
-    lines = [i.strip() for i in m.text.replace(',', '\n').split('\n') if i.strip()]
-    st = await m.answer(f"⏳ Processing {len(lines)} items...")
-    db = SessionLocal(); added = 0
-    for w in lines:
-        # ПЕРЕЗАПИСЬ: Удаляем слово, если оно уже существует
-        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
-        data = await ai_request(f"Define '{w}'. JSON: {{\"d\":\"def\", \"c\":\"word\"}}", "Vocab Teacher.", True)
-        if data:
-            db.add(Vocab(user_id=m.from_user.id, word=w, definition=data.get('d'), category="all"))
-            added += 1
-            if added % 5 == 0: await st.edit_text(f"⏳ Progress: {added}/{len(lines)}...")
-    db.commit(); db.close()
-    await st.edit_text(f"✅ Added/Updated {added} items.")
-
-@dp.callback_query(F.data.startswith("list_"))
-async def list_words(cb: types.CallbackQuery):
-    off = int(cb.data.split('_')[1]); db = SessionLocal()
-    words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
-    if not words and off == 0: await cb.answer("Empty."); return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
-    if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
-    # Если мы вернулись назад, добавляем кнопку Назад
-    if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
-    try: await cb.message.edit_text("Tap to delete:", reply_markup=kb)
-    except: pass
-
-@dp.callback_query(F.data.startswith("del_"))
-async def del_word(cb: types.CallbackQuery):
-    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
-    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
-    await cb.answer("Deleted.")
-    # ФИКС: После удаления обновляем список на той же странице (offset)
-    await list_words(cb)
 
 async def start_web_server():
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
