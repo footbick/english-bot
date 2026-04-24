@@ -44,7 +44,7 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. TOOLS ---
+# --- 3. CORE TOOLS ---
 def clean_json(text):
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -56,9 +56,14 @@ async def ai_request(prompt, system_msg, json_mode=False):
     for attempt in range(2):
         def call():
             try:
-                # ПРАВКА 3: Строгий запрет на HTML теги в значениях
+                # СТРОГИЙ ПРОМПТ: Chain of Thought для грамматики и запрет HTML
+                instr = (system_msg + 
+                        " IMPORTANT: First, analyze the grammar structure. "
+                        "If you see 'If + Past', it is Second Conditional. If 'If + Present', it is First. "
+                        "NEVER use HTML tags like <b> or <i> in JSON values. "
+                        "Field 'ru' must be ONLY Russian Cyrillic.")
                 res = client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: NEVER use HTML tags like <b> in your response. Field 'ru' MUST be Russian."}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": instr}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
                     response_format={"type": "json_object"} if json_mode else None,
                     timeout=45
@@ -103,15 +108,15 @@ async def send_next_step(user_id):
                 opts = data.get('o', [])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
-                # ПРАВКА 3.1: Скрытый перевод спойлером
+                # Скрытый перевод и чистый текст
                 sess.update({'correct_id': opts.index(target.word), 'exp': f"{target.word}\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
                 await bot.send_poll(user_id, f"{header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
         topic = sess.get('grammar_topic', 'general')
-        # ПРАВКА 4: Усиленный промпт для точности правил
-        data = await ai_request(f"Topic: {topic}. UNIQUE quiz. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule in english\",\"ru\":\"разбор\"}}", "Grammar Master. Logic accuracy 100% required. NO technical placeholders.", True)
-        sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
+        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule\",\"ru\":\"разбор\"}}", "Grammar PhD. Be extremely precise with Conditional types.", True)
+        # Скрытый разбор и чистый текст
+        sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
         if header: await bot.send_message(user_id, header)
         await bot.send_poll(user_id, data['q'], data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
     except:
@@ -135,24 +140,16 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach Active!", reply_markup=kb)
+    await m.answer("🎯 Coach v9.6 Ready!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
     db = SessionLocal(); count = db.query(Vocab).filter(Vocab.user_id == m.from_user.id).count(); db.close()
-    # ПРАВКА 1: Оставляем 3 пункта
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔤 Start Learning", callback_data="voc_all")],
         [InlineKeyboardButton(text="➕ Add New", callback_data="voc_add"), InlineKeyboardButton(text="🗑 Delete", callback_data="list_0")]
     ])
     await m.answer(f"Vocabulary ({count} items):", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("voc_"))
-async def v_start(cb: types.CallbackQuery):
-    cat = cb.data.split("_")[1]
-    if cat == "add": await cb.message.answer("⌨️ Send words (one per line)."); return
-    user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'vocab_category': 'all', 'used': []}
-    await send_next_step(cb.from_user.id); await cb.answer()
 
 @dp.callback_query(F.data.startswith("list_"))
 async def list_words(cb: types.CallbackQuery):
@@ -162,8 +159,8 @@ async def list_words(cb: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
     if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
-    # ПРАВКА 2: Редактируем сообщение, чтобы список оставался на месте
-    try: await cb.message.edit_text("🗑 Tap to delete:", reply_markup=kb)
+    # Редактируем сообщение, чтобы список оставался на месте
+    try: await cb.message.edit_text("Tap to delete:", reply_markup=kb)
     except: pass
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -171,25 +168,17 @@ async def del_word(cb: types.CallbackQuery):
     wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
     db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
     await cb.answer("Deleted.")
+    # ФИКС: Обновляем только клавиатуру, список на месте
     await list_words(cb)
 
-# ПРАВКА 5: Полноценное извлечение текста из PDF
 @dp.message(F.document)
 async def handle_pdf(m: types.Message):
     if not m.document.file_name.endswith('.pdf'): return
     st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
     content = await bot.download_file(file.file_path)
-    
-    # Чтение PDF
     reader = PdfReader(io.BytesIO(content.read()))
-    text_data = ""
-    for page in reader.pages[:5]: # Берем первые 5 страниц для анализа
-        text_data += page.extract_text() + "\n"
-    
-    if len(text_data.strip()) < 10:
-        await st.edit_text("❌ Could not extract text from PDF."); return
-
-    res = await ai_request(f"Extract 10 useful words/phrases. JSON: {{\"items\":[\"w1\",\"w2\"]}}. Text: {text_data[:3000]}", "Linguist.", True)
+    text_data = "".join([p.extract_text() for p in reader.pages[:5]])
+    res = await ai_request(f"Extract 10 useful words. JSON: {{\"items\":[\"w1\"]}}. Text: {text_data[:3000]}", "Linguist.", True)
     items = res.get('items', []); db = SessionLocal()
     for i in items:
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
@@ -209,14 +198,15 @@ async def g_start(cb: types.CallbackQuery):
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
-    st = await m.answer("⏳ Generating topics..."); res = await ai_request("5 B2 topics. JSON: {\"topics\":[\"T1\",\"T2\"]}", "JSON.", True)
+    st = await m.answer("⏳ Generating topics...")
+    res = await ai_request("5 catchy topics. JSON: {\"topics\":[\"T1\",\"T2\"]}", "JSON.", True)
     topics = res.get('topics', [])
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"spk_st_{t[:20]}")] for t in topics])
     await st.delete(); await m.answer("🗣 Pick a topic:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
-    topic = cb.data[7:]; q = await ai_request(f"Start conversation about {topic}. 1 sentence.", "Teacher.")
+    topic = cb.data[7:]; q = await ai_request(f"Start conversation about {topic}.", "Teacher.")
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 <b>Topic: {topic}</b>\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg"))
@@ -230,9 +220,8 @@ async def handle_voice(m: types.Message):
     trans = client.audio.transcriptions.create(file=("v.ogg", voice_bytes), model="whisper-large-v3", language="en").text
     await st.edit_text(f"💬 You: {trans}")
     history = user_sessions[m.from_user.id].get('history', [])
-    resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly.", "Teacher.")
-    history.append(trans); history.append(resp)
-    await m.answer(f"🗣 {resp}")
+    resp = await ai_request(f"History: {history}. User: {trans}.", "Teacher.")
+    history.append(trans); history.append(resp); await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
 @dp.message(F.text == "📊 My Progress")
