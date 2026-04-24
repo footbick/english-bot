@@ -44,7 +44,7 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. CORE TOOLS ---
+# --- 3. TOOLS ---
 def clean_json(text):
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -56,8 +56,8 @@ async def ai_request(prompt, system_msg, json_mode=False):
     for attempt in range(2):
         def call():
             try:
-                # Эмодзи строго в начале ответа
-                instr = system_msg + " MANDATORY: Start with ONE emoji. NO HTML. NO labels. NO emojis inside text."
+                # ПРАВИЛО: Эмодзи только в начале
+                instr = system_msg + " MANDATORY: Put ONE emoji ONLY at the very start of the response. NO HTML. NO internal emojis."
                 res = client.chat.completions.create(
                     messages=[{"role": "system", "content": instr}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
@@ -104,16 +104,15 @@ async def send_next_step(user_id):
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
                 
-                # Спойлер и эмодзи в начале
                 sess.update({'correct_id': opts.index(target.word), 'exp': f"📖 {target.word}\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
-                await bot.send_poll(user_id, f"{header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
+                await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
         topic = sess.get('grammar_topic', 'general')
-        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule\",\"ru\":\"разбор\"}}", "Grammar PhD.", True)
+        data = await ai_request(f"Topic: {topic}. JSON: {{\"q\":\".. ____ ..\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule\",\"ru\":\"разбор\"}}", "Grammar PhD.", True)
         
         sess.update({'correct_id': data['c'], 'exp': f"📝 {data['e']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
-        if header: await bot.send_message(user_id, header)
+        if header: await bot.send_message(user_id, f"🎓 {header}")
         await bot.send_poll(user_id, data['q'], data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
 
     except:
@@ -137,7 +136,8 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach Active!", reply_markup=kb)
+    # ПРАВКА: Четкая версия в приветствии
+    await m.answer("🎯 Coach v9.2 (Stable Engine) Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -192,6 +192,7 @@ async def list_words(cb: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
     if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
+    # ПРАВКА: Список остается на месте
     try: await cb.message.edit_text("🗑 Tap to delete:", reply_markup=kb)
     except: pass
 
@@ -200,23 +201,24 @@ async def del_word(cb: types.CallbackQuery):
     wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
     db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit(); db.close()
     await cb.answer("🗑 Deleted.")
-    # ФИКС: Удаляем только кнопку, остальной список на месте
     await list_words(cb)
 
-# --- NEW: PDF HANDLER ---
+# --- NEW: PDF HANDLER WITH PROGRESS ---
 @dp.message(F.document)
 async def handle_pdf(m: types.Message):
     if not m.document.file_name.endswith('.pdf'): return
-    st = await m.answer("⏳ Downloading PDF...")
+    st = await m.answer("⏳ Downloading PDF (0%)...")
     file = await bot.get_file(m.document.file_id)
     content = await bot.download_file(file.file_path)
     
-    reader = PdfReader(io.BytesIO(content.read()))
+    await st.edit_text("⏳ Reading Pages (50%)...")
+    pdf_bytes = content.read()
+    reader = PdfReader(io.BytesIO(pdf_bytes))
     text_data = ""
     for page in reader.pages[:3]: text_data += page.extract_text()
     
-    await st.edit_text("⏳ AI is extracting words...")
-    res = await ai_request(f"Extract 10-15 useful words/phrases. JSON: {{\"items\":[\"w1\",\"w2\"]}}. Text: {text_data[:2000]}", "Linguist.", True)
+    await st.edit_text("⏳ AI Extracting Words (80%)...")
+    res = await ai_request(f"Extract 10 useful words. JSON: {{\"items\":[\"w1\"]}}. Text: {text_data[:2000]}", "Linguist.", True)
     
     items = res.get('items', [])
     db = SessionLocal()
@@ -226,7 +228,7 @@ async def handle_pdf(m: types.Message):
     db.commit(); db.close()
     await st.edit_text(f"✅ Extracted and added {len(items)} items from PDF.")
 
-# --- SPEAKING SECTION ---
+# --- SPEAKING SECTION (FIXED) ---
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
     st = await m.answer("⏳ Generating topics...")
@@ -247,9 +249,13 @@ async def spk_init(cb: types.CallbackQuery):
 async def handle_voice(m: types.Message):
     if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking': return
     st = await m.answer("👂 Listening...")
-    file = await bot.get_file(m.voice.file_id); content = await bot.download_file(file.file_path)
-    trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
+    file = await bot.get_file(m.voice.file_id)
+    content = await bot.download_file(file.file_path)
+    # ПРАВКА: Чтение байтов напрямую
+    voice_bytes = content.read()
+    trans = client.audio.transcriptions.create(file=("v.ogg", voice_bytes), model="whisper-large-v3", language="en").text
     await st.edit_text(f"💬 You: {trans}")
+    
     history = user_sessions[m.from_user.id].get('history', [])
     resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly.", "Teacher.")
     history.append(trans); history.append(resp)
@@ -274,6 +280,7 @@ async def send_reminder():
 async def main():
     init_db(); asyncio.create_task(start_web_server())
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    # ПРАВКА: Уведомления 4 раза в день
     scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18', minute=0))
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
