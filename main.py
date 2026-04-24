@@ -56,9 +56,9 @@ async def ai_request(prompt, system_msg, json_mode=False):
     for attempt in range(2):
         def call():
             try:
-                # ПРАВКА 3 и 4: Запрет HTML и строгая логика правил
+                # ПРАВКА 3: Строгий запрет на HTML теги в значениях
                 res = client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: NO HTML tags. NO technical placeholders like 'definition'. Logical grammar accuracy is 100% required."}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": system_msg + " IMPORTANT: NEVER use HTML tags like <b> in your response. Field 'ru' MUST be Russian."}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
                     response_format={"type": "json_object"} if json_mode else None,
                     timeout=45
@@ -99,20 +99,19 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                data = await ai_request(f"Provide quiz for word '{target.word}'. JSON: {{\"d\":\"meaning of word\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"перевод\"}}", "Expert Teacher.", True)
-                if not data: raise Exception("AI Fail")
+                data = await ai_request(f"Word: {target.word}. JSON: {{\"d\":\"definition\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"перевод\"}}", "Expert Teacher.", True)
                 opts = data.get('o', [])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
-                # ПРАВКА 2: Скрытый перевод спойлером
+                # ПРАВКА 3.1: Скрытый перевод спойлером
                 sess.update({'correct_id': opts.index(target.word), 'exp': f"{target.word}\n{data['d']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
                 await bot.send_poll(user_id, f"{header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
         topic = sess.get('grammar_topic', 'general')
-        data = await ai_request(f"Topic: {topic}. Create unique quiz. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule in english\",\"ru\":\"разбор\"}}", "Grammar Master. Double check rules accuracy.", True)
-        if not data: raise Exception("AI Fail")
-        sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
+        # ПРАВКА 4: Усиленный промпт для точности правил
+        data = await ai_request(f"Topic: {topic}. UNIQUE quiz. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"rule in english\",\"ru\":\"разбор\"}}", "Grammar Master. Logic accuracy 100% required. NO technical placeholders.", True)
+        sess.update({'correct_id': data['c'], 'exp': f"{data['e']}\n\n🇷🇺 <tg-spoiler>{data['ru']}</tg-spoiler>"})
         if header: await bot.send_message(user_id, header)
         await bot.send_poll(user_id, data['q'], data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
     except:
@@ -163,7 +162,7 @@ async def list_words(cb: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
     if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
-    # ПРАВКА 2: Редактируем сообщение, чтобы список не «прыгал»
+    # ПРАВКА 2: Редактируем сообщение, чтобы список оставался на месте
     try: await cb.message.edit_text("🗑 Tap to delete:", reply_markup=kb)
     except: pass
 
@@ -174,15 +173,23 @@ async def del_word(cb: types.CallbackQuery):
     await cb.answer("Deleted.")
     await list_words(cb)
 
-# ПРАВКА 5: Загрузка PDF из последней версии
+# ПРАВКА 5: Полноценное извлечение текста из PDF
 @dp.message(F.document)
 async def handle_pdf(m: types.Message):
     if not m.document.file_name.endswith('.pdf'): return
     st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
     content = await bot.download_file(file.file_path)
+    
+    # Чтение PDF
     reader = PdfReader(io.BytesIO(content.read()))
-    text_data = "".join([p.extract_text() for p in reader.pages[:3]])
-    res = await ai_request(f"Extract 10 useful words. JSON: {{\"items\":[\"w1\"]}}. Text: {text_data[:2000]}", "Linguist.", True)
+    text_data = ""
+    for page in reader.pages[:5]: # Берем первые 5 страниц для анализа
+        text_data += page.extract_text() + "\n"
+    
+    if len(text_data.strip()) < 10:
+        await st.edit_text("❌ Could not extract text from PDF."); return
+
+    res = await ai_request(f"Extract 10 useful words/phrases. JSON: {{\"items\":[\"w1\",\"w2\"]}}. Text: {text_data[:3000]}", "Linguist.", True)
     items = res.get('items', []); db = SessionLocal()
     for i in items:
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
