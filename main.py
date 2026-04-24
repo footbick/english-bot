@@ -43,43 +43,34 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. GRAMMAR ARCHITECTURE (DIVERSITY FIX) ---
+# --- 3. PROMPT ARCHITECTURE ---
 BASE_PROMPT = """
 You are a strict English grammar test generator.
 RULES:
-- Generate ONE unique test question. Only ONE correct answer.
-- NO HTML tags. NO technical placeholders like 'w1'.
-- EXTREME DIVERSITY: Use contexts like space, history, deep sea, cooking, advanced technology, emotions, career.
-- NEVER repeat 'lottery', 'beach', or 'buying a house' examples.
-- Use different subjects (The scientists, A lonely traveler, The software engineers).
-- Question, answer and explanation MUST match perfectly.
+- Generate ONE unique question. Only ONE correct answer.
+- NO HTML. NO technical labels like 'w1'.
+- EXTREME DIVERSITY: Use Medicine, Construction, Wildlife, Ancient Egypt, Gardening, Fashion, Sports, Law, Cooking, Music.
+- STRICT BANNED TOPICS: NEVER mention Astronauts, Space, NASA, Lottery, or Beach.
+- Distractors must be realistic. Match explanation to the question.
 
-Return JSON ONLY:
+Return JSON:
 {
 "q": "sentence with ____",
 "o": ["a","b","c","d"],
 "c": 0,
-"e": "short explanation in English",
+"e": "short English explanation",
 "ru": "короткий разбор на русском"
 }
 """
 
 TOPIC_RULES = {
-    "conditionals": "Use zero/first/second/third/mixed. STRICT: If+Past=2nd, If+Present=1st. NEVER use 'was' for 2nd Cond, ONLY 'were'.",
-    "passive": "Use Passive Voice (be + V3). Test various tenses (Future, Perfect, Past Continuous).",
-    "complex": "Use Complex Object (verb + object + infinitive/V-ing). Example: I heard them talking.",
-    "participle": "Test V-ing vs V3. Use sophisticated sentences.",
-    "prepositions": "Test prepositions in professional or academic contexts.",
-    "general": "Mix all advanced grammar concepts randomly."
+    "conditionals": "Use ONLY zero/first/second/third/mixed. STRICT: If+Past=2nd, If+Present=1st. NEVER use 'was' for 2nd Cond, ONLY 'were'.",
+    "passive": "Use Passive Voice (be + V3). Test various tenses.",
+    "complex": "Use Complex Object (verb + object + infinitive).",
+    "participle": "Test V-ing vs V3. Sophisticated context.",
+    "prepositions": "Test common prepositions in academic or professional life.",
+    "general": "Mix all grammar rules randomly."
 }
-
-def is_valid_grammar(data, topic):
-    try:
-        q, correct = data['q'].lower(), data['o'][data['c']].lower()
-        if topic == "conditionals":
-            if "would" in q and "were" not in q and "if" in q and "was" in correct: return False
-        return True
-    except: return False
 
 # --- 4. CORE TOOLS ---
 def clean_json(text):
@@ -94,10 +85,10 @@ async def ai_request(prompt, system_msg, json_mode=False):
         def call():
             try:
                 res = client.chat.completions.create(
-                    messages=[{"role": "system", "content": system_msg + " NO HTML TAGS."}, {"role": "user", "content": prompt}],
+                    messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
                     response_format={"type": "json_object"} if json_mode else None,
-                    timeout=45
+                    timeout=50
                 ).choices[0].message.content
                 return json.loads(clean_json(res)) if json_mode else res
             except: return None
@@ -123,44 +114,42 @@ async def send_next_step(user_id):
             await bot.send_message(user_id, f"🏆 Exam Result: {sess['score']}/10")
             user_sessions.pop(user_id, None); return
 
+        header = f"Question {sess['step'] + 1}/10\n\n"
         q_type = random.choice(['vocab', 'grammar']) if is_ex else sess['type']
 
         if q_type == 'vocab':
             target = db.query(Vocab).filter(Vocab.user_id == user_id, ~Vocab.id.in_(sess.get('used', []))).order_by(func.random()).first()
             if not target:
                 if is_ex: q_type = 'grammar'
-                else: await bot.send_message(user_id, "⚠️ Your dictionary is empty."); return
+                else: sess['used'] = []; await bot.send_message(user_id, "🔄 Restarting list..."); await send_next_step(user_id); return
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                # ФИКС: Требуем 4 реальных варианта ответа и смысл в 'd'
-                prompt = f"Create quiz for word '{target.word}'. JSON: {{\"d\":\"clear definition (no placeholder)\",\"o\":[\"{target.word}\",\"synonym1\",\"synonym2\",\"synonym3\"],\"ru\":\"перевод\"}}"
-                data = await ai_request(prompt, "English Teacher. NO technical labels.", True)
+                p = f"Create quiz for '{target.word}'. JSON: {{\"d\":\"definition\",\"o\":[\"{target.word}\",\"s1\",\"s2\",\"s3\"],\"ru\":\"перевод\"}}"
+                data = await ai_request(p, "Teacher.", True)
                 opts = data.get('o', [target.word, "word_b", "word_c", "word_d"])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
+                
                 sess.update({'correct_id': opts.index(target.word), 'exp': data['d'], 'ru': data['ru'], 'word': target.word})
-                await bot.send_poll(user_id, f"🎯 {data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
+                await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
+        # GRAMMAR
         topic = sess.get('grammar_topic', 'general')
         final_prompt = BASE_PROMPT + "\n" + TOPIC_RULES.get(topic, TOPIC_RULES["general"])
-        final_prompt += f"\nUnique Seed: {random.randint(1, 1000000)}"
+        final_prompt += f"\nUnique ID: {random.randint(1, 99999)}"
         
-        data = None
-        for _ in range(4):
-            candidate = await ai_request(final_prompt, "Strict Grammar PhD.", True)
-            if candidate and is_valid_grammar(candidate, topic):
-                data = candidate; break
+        data = await ai_request(final_prompt, "Grammar PhD. STRICT diversity.", True)
+        if not data: raise Exception("Fail")
         
-        if not data:
-            await bot.send_message(user_id, "⚠️ AI calibration... trying again."); await send_next_step(user_id); return
-
+        # СБРОС СЛОВА перед грамматикой, чтобы не было ошибки hold on
+        sess.pop('word', None)
         sess.update({'correct_id': data['c'], 'exp': data['e'], 'ru': data['ru']})
-        await bot.send_poll(user_id, f"🎓 {data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
+        await bot.send_poll(user_id, f"🎓 {header}{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
 
     except:
-        await bot.send_message(user_id, "⚠️ AI timeout. Click again.")
+        await bot.send_message(user_id, "⚠️ AI connection slow. Click again.")
     finally: db.close()
 
 @dp.poll_answer()
@@ -170,10 +159,12 @@ async def handle_poll(p: PollAnswer):
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
     
-    word_label = f"{sess['word']}\n" if 'word' in sess else ""
+    # ПРАВКА: Используем .pop(), чтобы слово исчезало из сессии после использования
+    word_val = sess.pop('word', None)
+    word_label = f"{word_val}\n" if word_val else ""
+    
     await bot.send_message(uid, f"💡 {word_label}{sess.get('exp')}")
-    # ФИКС: Включаем ParseMode.HTML для скрытия спойлера
-    await bot.send_message(uid, f"🇷🇺 <tg-spoiler>{sess.get('ru')}</tg-spoiler>", parse_mode=ParseMode.HTML, disable_notification=True)
+    await bot.send_message(uid, f"🇷🇺 {sess.get('ru')}", disable_notification=True)
     
     sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
@@ -185,7 +176,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v10.5 Active!", reply_markup=kb)
+    await m.answer("🎯 Coach v10.6 Ready!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -229,12 +220,12 @@ async def handle_pdf(m: types.Message):
     st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
     content = await bot.download_file(file.file_path); reader = PdfReader(io.BytesIO(content.read()))
     text_data = "".join([p.extract_text() for p in reader.pages[:3]])
-    res = await ai_request(f"Extract 10 useful words from: {text_data[:2000]}", "JSON: {\"items\":[\"w1\"]}", True)
+    res = await ai_request(f"Extract 10 words: {text_data[:2000]}", "JSON: {\"items\":[\"w1\"]}", True)
     items = res.get('items', []); db = SessionLocal()
     for i in items:
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
         db.add(Vocab(user_id=m.from_user.id, word=i))
-    db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items.")
+    db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items from PDF.")
 
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
@@ -245,8 +236,7 @@ async def spk_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
     topic = cb.data[7:]
-    # ФИКС: Возврат к 2-3 предложениям
-    q = await ai_request(f"Start B2 conversation about {topic}. Use strictly 2-3 sentences.", "Teacher. NO HTML.", False)
+    q = await ai_request(f"Start B2 conversation about {topic}. Strictly 2-3 sentences.", "Teacher.", False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 Topic: {topic}\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg")); await cb.answer()
@@ -256,8 +246,7 @@ async def handle_voice(m: types.Message):
     if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking': return
     file = await bot.get_file(m.voice.file_id); content = await bot.download_file(file.file_path)
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
-    # ФИКС: Ответ строго 2-3 предложения
-    resp = await ai_request(f"User: {trans}. Reply and ask question in strictly 2-3 sentences.", "Teacher. NO HTML.", False)
+    resp = await ai_request(f"History: {user_sessions[uid].get('history', [])}. User: {trans}. Reply 2-3 sentences.", "Teacher.", False)
     user_sessions[m.from_user.id].setdefault('history', []).append(trans)
     await m.answer(f"🗣 {resp}"); v = await generate_voice(resp)
     await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
