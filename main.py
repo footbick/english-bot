@@ -47,25 +47,28 @@ def init_db():
 # --- 3. PROMPT SYSTEM ---
 BASE_PROMPT = """
 You are a strict English grammar examiner.
-RULES:
+STRICT RULES:
 - Generate ONE unique test question. Only ONE correct answer.
-- NO HTML tags. Field 'ru' MUST be Russian Cyrillic.
-- EXTREME DIVERSITY: Use topics like archaeology, biology, laws, art, emotions.
-- STRICTLY FORBIDDEN: Space, Astronauts, Lottery, Beach.
-- Conditionals Logic:
-  * 3rd Cond: If + had + V3, would have + V3.
-  * Mixed (3->2): If + had + V3, would + base (used for past cause -> present result).
-  * 2nd Cond: If + Past Simple, would + base.
-  * NEVER use 'was' for 2nd/Mixed, only 'were'.
+- No ambiguity. Use natural, sophisticated English.
+- Avoid repeating patterns. Use contexts like gardening, medicine, tech, arts.
+- FORBIDDEN: Astronauts, Space, Lottery.
+- RETURN JSON ONLY. NO HTML tags inside JSON.
+{"q": "sentence with ____", "o": ["a","b","c","d"], "c": 0, "e": "explanation", "ru": "разбор"}
 """
 
 TOPIC_RULES = {
-    "conditionals": "Focus on 2nd, 3rd and Mixed (3->2) types. Ensure the correct answer index matches the logic.",
-    "passive": "Passive Voice across all tenses.",
-    "complex": "Complex Object (verb + object + infinitive).",
-    "participle": "Participle Clauses (V-ing vs V3).",
-    "prepositions": "Common dependent prepositions.",
-    "general": "Random mix of B2 grammar."
+    "conditionals": """
+    RULES:
+    - Third Conditional: If + Past Perfect -> would have + V3 (Past result).
+    - Mixed Conditional (3->2): If + Past Perfect -> would + base (Present result).
+    - ONLY use Mixed if there is a clear 'now' or 'today' marker. Otherwise, prefer standard Third Conditional.
+    - Second Conditional: If + Past Simple -> would + base. ALWAYS use 'were', NEVER 'was'.
+    """,
+    "passive": "Focus on Passive Voice (be + V3) across all tenses.",
+    "complex": "Focus on Complex Object structures.",
+    "participle": "Focus on Participle Clauses (V-ing vs V3).",
+    "prepositions": "Test dependent prepositions in common combinations.",
+    "general": "Mix all advanced grammar rules randomly."
 }
 
 # --- 4. VALIDATION & ANTI-DUPLICATE ---
@@ -76,19 +79,20 @@ def is_similar(q1, q2):
     return SequenceMatcher(None, normalize_q(q1), normalize_q(q2)).ratio() > 0.6
 
 def is_duplicate(sess, q):
-    return any(is_similar(q, h) for h in sess.get('history', []))
+    history = sess.get('history', [])
+    return any(is_similar(q, h) for h in history)
 
 def add_to_history(sess, q):
-    h = sess.get('history', []); h.append(q)
-    if len(h) > 20: h.pop(0)
-    sess['history'] = h
+    history = sess.get('history', [])
+    history.append(q)
+    if len(history) > 20: history.pop(0)
+    sess['history'] = history
 
-def is_valid_conditional(data):
+def is_consistent(data):
     try:
-        q, correct = data['q'].lower(), data['o'][data['c']].lower()
-        if "if" in q and "had" in q and ("now" in q or "by now" in q): # Mixed 3/2
-            return "would" in correct and "have" not in correct
-        if "if" in q and "had" in q and "would have" in q: return "had" in correct or "would" in correct
+        q, exp = data['q'].lower(), data['e'].lower()
+        if "second conditional" in exp and "would" not in q: return False
+        if "third conditional" in exp and "would have" not in q: return False
         return True
     except: return False
 
@@ -142,8 +146,7 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                p = f"Explain word '{target.word}'. JSON: {{\"d\":\"meaning\", \"o\":[\"{target.word}\",\"w2\",\"w3\",\"w4\"], \"ru\":\"перевод\"}}"
-                data = await ai_request(p, "Teacher.", True)
+                data = await ai_request(f"Explain '{target.word}'. JSON: {{\"d\":\"def\", \"o\":[\"{target.word}\", \"w2\", \"w3\", \"w4\"], \"ru\":\"перевод\"}}", "Teacher.", True)
                 opts = data.get('o', [target.word, "word_b", "word_c", "word_d"])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
@@ -151,15 +154,17 @@ async def send_next_step(user_id):
                 await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
+        # GRAMMAR WITH VALIDATION
         topic = sess.get('grammar_topic', 'general')
-        f_prompt = BASE_PROMPT + TOPIC_RULES.get(topic, TOPIC_RULES["general"])
-        f_prompt += f"\nVariation Seed: {random.randint(1, 999999)}"
+        final_prompt = BASE_PROMPT + TOPIC_RULES.get(topic, TOPIC_RULES["general"])
+        final_prompt += f"\nSeed: {random.randint(1, 999999)}"
         
         data = None
         for _ in range(4):
-            cand = await ai_request(f_prompt, "Strict JSON: {\"q\":\"..\",\"o\":[\"a\"],\"c\":0,\"e\":\"rule\",\"ru\":\"разбор\"}", True)
-            if cand and not is_duplicate(sess, cand['q']) and is_valid_conditional(cand):
-                add_to_history(sess, cand['q']); data = cand; break
+            candidate = await ai_request(final_prompt, "Grammar Master.", True)
+            if candidate and not is_duplicate(sess, candidate['q']) and is_consistent(candidate):
+                add_to_history(sess, candidate['q'])
+                data = candidate; break
         
         if not data:
             await bot.send_message(user_id, "⚠️ AI timeout. Trying again..."); await send_next_step(user_id); return
@@ -169,7 +174,7 @@ async def send_next_step(user_id):
         await bot.send_poll(user_id, f"🎓 {header}{data['q']}", data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
 
     except:
-        await bot.send_message(user_id, "⚠️ System slow. Click again.")
+        await bot.send_message(user_id, "⚠️ System error. Please click again.")
     finally: db.close()
 
 @dp.poll_answer()
@@ -178,12 +183,8 @@ async def handle_poll(p: PollAnswer):
     if uid not in user_sessions: return
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
-    
-    w_info = f"{sess['word']}\n" if 'word' in sess else ""
-    await bot.send_message(uid, f"💡 {w_info}{sess.get('exp')}")
-    # ПРАВКА: Скрываем перевод чисто, без отображения тегов
-    await bot.send_message(uid, f"🇷🇺 <tg-spoiler>{sess.get('ru')}</tg-spoiler>", parse_mode=ParseMode.HTML, disable_notification=True)
-    
+    await bot.send_message(uid, f"💡 {sess.get('exp')}")
+    await bot.send_message(uid, f"🇷🇺 {sess.get('ru')}", disable_notification=True)
     sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 # --- 7. HANDLERS ---
@@ -194,7 +195,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v11.1 Ready!", reply_markup=kb)
+    await m.answer("🎯 Coach Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -208,6 +209,16 @@ async def v_start(cb: types.CallbackQuery):
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'used': [], 'history': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
+@dp.callback_query(F.data.startswith("list_"))
+async def list_words(cb: types.CallbackQuery):
+    off = int(cb.data.split('_')[1]); db = SessionLocal()
+    words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
+    if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
+    if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
+    try: await cb.message.edit_text("🗑 Delete words:", reply_markup=kb)
+    except: pass
+
 @dp.callback_query(F.data.startswith("del_"))
 async def del_word(cb: types.CallbackQuery):
     wid, off = map(int, cb.data.split('_')[1:3])
@@ -218,7 +229,34 @@ async def del_word(cb: types.CallbackQuery):
     if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
     await cb.message.edit_reply_markup(reply_markup=kb); await cb.answer("Deleted")
 
-# --- SPEAKING SECTION (RESTORED TO 10.7) ---
+@dp.message(F.text == "⚙️ Grammar Test")
+async def g_menu(m: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Passive Voice", callback_data="gt_passive"), InlineKeyboardButton(text="❓ Conditionals", callback_data="gt_conditionals")],
+        [InlineKeyboardButton(text="🔗 Complex Object", callback_data="gt_complex"), InlineKeyboardButton(text="✨ Participle", callback_data="gt_participle")],
+        [InlineKeyboardButton(text="📍 Prepositions", callback_data="gt_prepositions"), InlineKeyboardButton(text="🎲 Mixed Practice", callback_data="gt_general")]
+    ])
+    await m.answer("📝 Choose Topic:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("gt_"))
+async def g_start(cb: types.CallbackQuery):
+    user_sessions[cb.from_user.id] = {'type':'grammar', 'step':0, 'score':0, 'grammar_topic': cb.data.split("_")[1], 'used': [], 'history': []}
+    await send_next_step(cb.from_user.id); await cb.answer()
+
+@dp.message(F.document)
+async def handle_pdf(m: types.Message):
+    if not m.document.file_name.endswith('.pdf'): return
+    st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
+    content = await bot.download_file(file.file_path); reader = PdfReader(io.BytesIO(content.read()))
+    text_data = "".join([p.extract_text() for p in reader.pages[:3]])
+    res = await ai_request(f"Extract 10 words from: {text_data[:2000]}", "JSON: {\"items\":[\"w1\"]}", True)
+    items = res.get('items', []); db = SessionLocal()
+    for i in items:
+        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
+        db.add(Vocab(user_id=m.from_user.id, word=i))
+    db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items from PDF.")
+
+# --- SPEAKING SECTION (v10.7 REVERT) ---
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
     res = await ai_request("5 catchy topics", "JSON: {\"topics\":[\"T1\"]}", True)
@@ -227,7 +265,8 @@ async def spk_menu(m: types.Message):
 
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
-    topic = cb.data[7:]; q = await ai_request(f"Start B2 conversation about {topic}. Strictly 2 sentences.", "Teacher.", False)
+    topic = cb.data[7:]
+    q = await ai_request(f"Start B2 conversation about {topic}. Strictly 2 sentences.", "Teacher.", False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 Topic: {topic}\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg")); await cb.answer()
@@ -242,33 +281,15 @@ async def handle_voice(m: types.Message):
     await m.answer(f"🗣 {resp}"); v = await generate_voice(resp)
     await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
-# --- PDF & GRAMMAR HANDLERS ---
-@dp.message(F.document)
-async def handle_pdf(m: types.Message):
-    if not m.document.file_name.endswith('.pdf'): return
-    st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id); content = await bot.download_file(file.file_path)
-    reader = PdfReader(io.BytesIO(content.read())); text_data = "".join([p.extract_text() for p in reader.pages[:3]])
-    res = await ai_request(f"Extract 10 words: {text_data[:2000]}", "JSON: {\"items\":[\"w1\"]}", True)
-    items = res.get('items', []); db = SessionLocal()
-    for i in items:
-        db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
-        db.add(Vocab(user_id=m.from_user.id, word=i))
-    db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items.")
+# --- 8. RUN ---
+async def start_web_server():
+    app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
 
-@dp.message(F.text == "⚙️ Grammar Test")
-async def g_menu(m: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Passive Voice", callback_data="gt_passive"), InlineKeyboardButton(text="❓ Conditionals", callback_data="gt_conditionals")],[InlineKeyboardButton(text="🔗 Complex Object", callback_data="gt_complex"), InlineKeyboardButton(text="✨ Participle", callback_data="gt_participle")],[InlineKeyboardButton(text="📍 Prepositions", callback_data="gt_prepositions"), InlineKeyboardButton(text="🎲 Mixed Practice", callback_data="gt_general")]])
-    await m.answer("📝 Choose Topic:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("gt_"))
-async def g_start(cb: types.CallbackQuery):
-    user_sessions[cb.from_user.id] = {'type':'grammar', 'step':0, 'score':0, 'grammar_topic': cb.data.split("_")[1], 'used': [], 'history': []}
-    await send_next_step(cb.from_user.id); await cb.answer()
-
-@dp.message(F.text == "📊 My Progress")
-async def exam_mode(m: types.Message):
-    user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': [], 'history': []}
-    await m.answer("🏆 Starting Exam"); await send_next_step(m.from_user.id)
+async def main():
+    init_db(); asyncio.create_task(start_web_server())
+    await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
 @dp.message(F.text)
 async def manual_add(m: types.Message):
@@ -279,14 +300,5 @@ async def manual_add(m: types.Message):
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
         db.add(Vocab(user_id=m.from_user.id, word=w))
     db.commit(); db.close(); await m.answer(f"✅ Added {len(lines)} items.")
-
-async def start_web_server():
-    app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
-
-async def main():
-    init_db(); asyncio.create_task(start_web_server())
-    await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
