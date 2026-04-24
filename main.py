@@ -44,7 +44,7 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. TOOLS ---
+# --- 3. CORE TOOLS ---
 def clean_json(text):
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -56,8 +56,8 @@ async def ai_request(prompt, system_msg, json_mode=False):
     for attempt in range(2):
         def call():
             try:
-                # ЖЕСТКИЙ ПРОМПТ: Эмодзи только в начале, русский только кириллицей
-                instr = system_msg + " MANDATORY: Start with 1 emoji. NO HTML. Field 'ru' MUST be in RUSSIAN language (Cyrillic). Don't use words like 'definition' as values."
+                # Жесткая инструкция по языку и оформлению
+                instr = system_msg + " MANDATORY: Start with 1 emoji. NO HTML. Field 'ru' MUST be in RUSSIAN (Cyrillic). Don't use placeholder words."
                 res = client.chat.completions.create(
                     messages=[{"role": "system", "content": instr}, {"role": "user", "content": prompt}],
                     model="llama-3.3-70b-versatile",
@@ -99,8 +99,8 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                # ФИКС: Просим именно MEANING, а не слово definition
-                data = await ai_request(f"Provide quiz for word '{target.word}'. JSON: {{\"d\":\"meaning of word\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"перевод на РУССКОМ\"}}", "Expert Teacher.", True)
+                # ПРАВКА: Четкий запрос смысла слова
+                data = await ai_request(f"Create quiz for '{target.word}'. JSON: {{\"d\":\"meaning in english\",\"o\":[\"{target.word}\",\"w1\",\"w2\",\"w3\"],\"ru\":\"перевод на русский\"}}", "Expert Teacher.", True)
                 opts = data['o']
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
@@ -109,16 +109,16 @@ async def send_next_step(user_id):
                 await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
-        topic = sess.get('grammar_topic', 'general')
-        # ФИКС: Тройная проверка логики грамматики
-        data = await ai_request(f"Topic: {topic}. Create unique B2 question. JSON: {{\"q\":\"sentence ____ rest\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"English rule\",\"ru\":\"разбор на РУССКОМ\"}}", "Grammar Master. Double check your correct answer index 'c' and rule logic.", True)
+        topic = sess.get('grammar_topic', 'all rules' if is_ex else 'general')
+        # ПРАВКА: Усиленный контроль грамматики
+        data = await ai_request(f"Topic: {topic}. Create unique B2 quiz. JSON: {{\"q\":\"sentence with ____\",\"o\":[\"a\",\"b\",\"c\",\"d\"],\"c\":0,\"e\":\"Eng rule\",\"ru\":\"разбор на русском\"}}", "Grammar Master. Double check rules logic (Tenses, Conditionals).", True)
         
         sess.update({'correct_id': data['c'], 'exp': f"📝 {data['e']}\n\n🇷🇺 <tg-spoiler>{data.get('ru', '---')}</tg-spoiler>"})
         if header: await bot.send_message(user_id, f"🎓 {header}")
         await bot.send_poll(user_id, data['q'], data['o'], type='quiz', correct_option_id=data['c'], is_anonymous=False)
 
     except:
-        await bot.send_message(user_id, "⚠️ AI was slow. Click again.")
+        await bot.send_message(user_id, "⚠️ AI timeout. Click again.")
     finally: db.close()
 
 @dp.poll_answer()
@@ -138,7 +138,7 @@ async def cmd_start(m: types.Message):
         db.add(User(user_id=m.from_user.id)); db.commit()
     db.close()
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📁 Upload PDF"), KeyboardButton(text="🎤 Speaking Practice")],[KeyboardButton(text="📚 Vocabulary"), KeyboardButton(text="⚙️ Grammar Test")],[KeyboardButton(text="📊 My Progress")]], resize_keyboard=True)
-    await m.answer("🎯 Coach v9.3 Active!", reply_markup=kb)
+    await m.answer("🎯 Coach v9.4 Final Fix Active!", reply_markup=kb)
 
 @dp.message(F.text == "📚 Vocabulary")
 async def v_menu(m: types.Message):
@@ -160,7 +160,7 @@ async def list_words(cb: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
     if off > 0: kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data=f"list_{max(0, off-8)}")])
-    # ФИКС: Список НЕ пропадает, а редактируется
+    # ФИКС: Список НЕ исчезает
     try: await cb.message.edit_text("🗑 Tap to delete:", reply_markup=kb)
     except: pass
 
@@ -185,7 +185,7 @@ async def g_start(cb: types.CallbackQuery):
 @dp.message(F.text == "📊 My Progress")
 async def exam_mode(m: types.Message):
     user_sessions[m.from_user.id] = {'type':'mix', 'step':0, 'score':0, 'is_exam': True, 'used': []}
-    await m.answer("🏆 Starting Exam (Mixed Mode)"); await send_next_step(m.from_user.id)
+    await m.answer("🏆 Starting Exam (All Grammar & Vocab)"); await send_next_step(m.from_user.id)
 
 @dp.message(F.text)
 async def manual_add(m: types.Message):
@@ -194,24 +194,30 @@ async def manual_add(m: types.Message):
     st = await m.answer(f"⏳ Processing {len(lines)} items...")
     db = SessionLocal()
     for w in lines:
+        # Перезапись
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == w).delete()
         db.add(Vocab(user_id=m.from_user.id, word=w, category="all"))
     db.commit(); db.close()
-    await st.edit_text(f"✅ Added {len(lines)} items.")
+    await st.edit_text(f"✅ Added {len(lines)} items. Definitions will be generated during practice.")
 
 @dp.message(F.document)
 async def handle_pdf(m: types.Message):
     if not m.document.file_name.endswith('.pdf'): return
-    st = await m.answer("⏳ Processing PDF..."); file = await bot.get_file(m.document.file_id)
-    content = await bot.download_file(file.file_path)
+    st = await m.answer("⏳ Step 1: Downloading PDF...")
+    file = await bot.get_file(m.document.file_id); content = await bot.download_file(file.file_path)
+    
+    await st.edit_text("⏳ Step 2: Reading content...")
     reader = PdfReader(io.BytesIO(content.read()))
     text_data = "".join([p.extract_text() for p in reader.pages[:3]])
-    res = await ai_request(f"Extract 10 words. JSON: {{\"items\":[\"w1\"]}}. Text: {text_data[:2000]}", "Linguist.", True)
+    
+    await st.edit_text("⏳ Step 3: AI Extracting words...")
+    res = await ai_request(f"Extract 10 useful words. JSON: {{\"items\":[\"w1\"]}}. Text: {text_data[:2000]}", "Linguist.", True)
+    
     items = res.get('items', []); db = SessionLocal()
     for i in items:
         db.query(Vocab).filter(Vocab.user_id == m.from_user.id, Vocab.word == i).delete()
         db.add(Vocab(user_id=m.from_user.id, word=i, category="all"))
-    db.commit(); db.close(); await st.edit_text(f"✅ Extracted {len(items)} items.")
+    db.commit(); db.close(); await st.edit_text(f"✅ Extracted {len(items)} items from PDF.")
 
 # --- SPEAKING SECTION ---
 @dp.message(F.text == "🎤 Speaking Practice")
@@ -233,28 +239,38 @@ async def spk_init(cb: types.CallbackQuery):
 @dp.message(F.voice)
 async def handle_voice(m: types.Message):
     if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking': return
-    st = await m.answer("👂 Listening...")
-    file = await bot.get_file(m.voice.file_id); content = await bot.download_file(file.file_path)
+    st = await m.answer("👂 Listening..."); file = await bot.get_file(m.voice.file_id)
+    content = await bot.download_file(file.file_path)
     voice_bytes = content.read()
-    # ФИКС: Whisper API call
+    # Whisper API
     trans = client.audio.transcriptions.create(file=("v.ogg", voice_bytes), model="whisper-large-v3", language="en").text
     await st.edit_text(f"💬 You: {trans}")
+    
     history = user_sessions[m.from_user.id].get('history', [])
     resp = await ai_request(f"History: {history}. User: {trans}. Reply briefly.", "Teacher.")
     history.append(trans); history.append(resp)
     await m.answer(f"🗣 {resp}")
     v = await generate_voice(resp); await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
-# --- 6. RUN ---
+# --- 6. RUN & REMINDERS ---
 async def start_web_server():
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
 
+async def send_reminder():
+    db = SessionLocal()
+    try:
+        users = db.query(User.user_id).all()
+        for u in users:
+            try: await bot.send_message(u.user_id, "🔔 Time for English practice!")
+            except: pass
+    finally: db.close()
+
 async def main():
     init_db(); asyncio.create_task(start_web_server())
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(lambda: asyncio.create_task(bot.send_message(90503024, "🔔 Reminder")), CronTrigger(hour='9,12,15,18', minute=0))
+    scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18', minute=0))
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
