@@ -42,13 +42,12 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. GRAMMAR RULES (v11.5) ---
+# --- 3. GRAMMAR RULES (v11.5/11.6) ---
 BASE_PROMPT = """
 You are a professional English Grammar Examiner. 
 STRICT RULES:
 - Generate ONE unique 'fill-in-the-blank' question. Use '____' for the gap.
-- Provide EXACTLY 3 answer options.
-- Only ONE answer is correct. 
+- Provide EXACTLY 3 answer options. Only ONE is correct. 
 - NO HTML tags.
 - RETURN JSON ONLY: {"q": "sentence with ____", "o": ["correct", "wrong1", "wrong2"], "c": 0, "e": "concise English rule", "ru": "разбор на русском"}
 """
@@ -128,20 +127,20 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                # v10.7 Vocab Logic
-                prompt = f"Explain word '{target.word}'. JSON: {{\"d\":\"definition\", \"o\":[\"{target.word}\", \"w2\", \"w3\"], \"ru\":\"перевод\"}}"
-                data = await ai_request(prompt, "English Teacher.", True)
+                # ПРАВКА: Инструкция давать ПРИМЕР предложения в 'e' и только СЛОВА в 'o'
+                prompt = f"Vocab quiz for '{target.word}'. JSON: {{\"d\":\"brief definition\", \"o\":[\"{target.word}\", \"distractor1\", \"distractor2\"], \"e\":\"One example sentence using '{target.word}'\", \"ru\":\"перевод\"}}"
+                data = await ai_request(prompt, "English Teacher. Use ONLY single words in options 'o'.", True)
                 opts = data.get('o', [target.word, "word_b", "word_c"])
                 if target.word not in opts: opts[0] = target.word
                 random.shuffle(opts)
-                sess.update({'correct_id': opts.index(target.word), 'exp': data['d'], 'ru': data['ru'], 'word': target.word})
+                sess.update({'correct_id': opts.index(target.word), 'exp': data['e'], 'ru': data['ru'], 'word': target.word})
                 await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
-        # GRAMMAR BLOCK (v11.5 Logic)
+        # GRAMMAR BLOCK (v11.5/11.6 Logic)
         topic = sess.get('grammar_topic', 'general')
         final_prompt = BASE_PROMPT + TOPIC_RULES.get(topic, TOPIC_RULES["general"])
-        final_prompt += f"\nVariation Seed: {random.randint(1, 1000000)}"
+        final_prompt += f"\nSeed: {random.randint(1, 1000000)}"
         
         data = None
         for _ in range(4):
@@ -151,7 +150,7 @@ async def send_next_step(user_id):
                 data = candidate; break
         
         if not data:
-            await bot.send_message(user_id, "⚠️ AI error. Trying again..."); await send_next_step(user_id); return
+            await bot.send_message(user_id, "⚠️ AI error. Retrying..."); await send_next_step(user_id); return
 
         sess.update({'correct_id': data['c'], 'exp': data['e'], 'ru': data['ru']})
         sess.pop('word', None)
@@ -168,8 +167,7 @@ async def handle_poll(p: PollAnswer):
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
     
-    word_label = f"{sess['word']}\n" if 'word' in sess else ""
-    # v11.5 Hidden translation in one message
+    word_label = f"Example: " if 'word' in sess else "Rule: "
     explanation = f"💡 {word_label}{sess.get('exp')}\n\n🇷🇺 <tg-spoiler>{sess.get('ru')}</tg-spoiler>"
     await bot.send_message(uid, explanation, parse_mode=ParseMode.HTML, disable_notification=True)
     
@@ -194,7 +192,6 @@ async def v_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("voc_"))
 async def v_start(cb: types.CallbackQuery):
     if cb.data == "voc_add": await cb.message.answer("⌨️ Send words."); await cb.answer(); return
-    # v10.7 fixed initialization
     user_sessions[cb.from_user.id] = {'type':'vocab', 'step':0, 'score':0, 'used': [], 'history': []}
     await send_next_step(cb.from_user.id); await cb.answer()
 
@@ -210,8 +207,7 @@ async def list_words(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_"))
 async def del_word(cb: types.CallbackQuery):
-    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal()
-    db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit()
+    wid, off = map(int, cb.data.split('_')[1:3]); db = SessionLocal(); db.query(Vocab).filter(Vocab.id == wid).delete(); db.commit()
     words = db.query(Vocab).filter(Vocab.user_id == cb.from_user.id).order_by(desc(Vocab.id)).limit(8).offset(off).all(); db.close()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"❌ {w.word}", callback_data=f"del_{w.id}_{off}")] for w in words])
     if len(words) == 8: kb.inline_keyboard.append([InlineKeyboardButton(text="Next ➡️", callback_data=f"list_{off+8}")])
@@ -245,16 +241,19 @@ async def handle_pdf(m: types.Message):
         db.add(Vocab(user_id=m.from_user.id, word=i))
     db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items from PDF.")
 
-# --- SPEAKING SECTION (v10.7 STYLE) ---
+# --- SPEAKING SECTION (REFACTORED FOR DEEP DIALOG) ---
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
-    st = await m.answer("⏳ Generating topics..."); res = await ai_request("5 catchy topics", "JSON: {\"topics\":[\"T1\"]}", True)
+    st = await m.answer("⏳ Generating topics..."); res = await ai_request("5 catchy personal topics", "JSON: {\"topics\":[\"T1\"]}", True)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"spk_st_{t[:20]}")] for t in res.get('topics', [])])
     await st.delete(); await m.answer("🗣 Pick a topic:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
-    topic = cb.data[7:]; q = await ai_request(f"Start B2 conversation about {topic}. Strictly 2 sentences.", "Teacher.", False)
+    topic = cb.data[7:]
+    # ПРАВКА: Бот начинает с личного вопроса
+    prompt = f"Topic: {topic}. Start a conversation by asking me a personal question about my thoughts, feelings, or experience with this. Strictly 2 sentences."
+    q = await ai_request(prompt, "Sympathetic friend. Do not test knowledge. Focus on emotions and experience.", False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 Topic: {topic}\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg")); await cb.answer()
@@ -264,8 +263,10 @@ async def handle_voice(m: types.Message):
     if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking': return
     file = await bot.get_file(m.voice.file_id); content = await bot.download_file(file.file_path)
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
-    resp = await ai_request(f"User: {trans}. Strictly 2 sentences.", "Teacher.", False)
-    user_sessions[m.from_user.id].setdefault('history', []).append(trans)
+    # ПРАВКА: Бот продолжает разговор вопросами о чувствах/опыте
+    prompt = f"User said: {trans}. Reply empathetically and ask a follow-up question about my feelings, habits, or past experience related to this topic. Strictly 2 sentences."
+    resp = await ai_request(prompt, "Caring interlocutor. Keep it personal, not academic.", False)
+    user_sessions[m.from_user.id]['history'].append(trans)
     await m.answer(f"🗣 {resp}"); v = await generate_voice(resp)
     await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
