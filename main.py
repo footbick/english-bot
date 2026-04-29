@@ -10,6 +10,8 @@ from groq import Groq
 from gtts import gTTS
 from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text, func, desc
 from sqlalchemy.orm import declarative_base, sessionmaker
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # --- 1. CONFIG ---
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +44,7 @@ class User(Base):
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-# --- 3. GRAMMAR RULES (v11.5/11.6) ---
+# --- 3. GRAMMAR RULES ---
 BASE_PROMPT = """
 You are a professional English Grammar Examiner. 
 STRICT RULES:
@@ -127,8 +129,7 @@ async def send_next_step(user_id):
             
             if target:
                 sess.setdefault('used', []).append(target.id)
-                # ПРАВКА: Инструкция давать ПРИМЕР предложения в 'e' и только СЛОВА в 'o'
-                prompt = f"Vocab quiz for '{target.word}'. JSON: {{\"d\":\"brief definition\", \"o\":[\"{target.word}\", \"distractor1\", \"distractor2\"], \"e\":\"One example sentence using '{target.word}'\", \"ru\":\"перевод\"}}"
+                prompt = f"Vocab quiz for '{target.word}'. JSON: {{\"d\":\"brief definition\", \"o\":[\"{target.word}\", \"word2\", \"word3\"], \"e\":\"Example sentence with '{target.word}'\", \"ru\":\"перевод\"}}"
                 data = await ai_request(prompt, "English Teacher. Use ONLY single words in options 'o'.", True)
                 opts = data.get('o', [target.word, "word_b", "word_c"])
                 if target.word not in opts: opts[0] = target.word
@@ -137,7 +138,6 @@ async def send_next_step(user_id):
                 await bot.send_poll(user_id, f"🎯 {header}{data['d']}", opts, type='quiz', correct_option_id=sess['correct_id'], is_anonymous=False)
                 return
 
-        # GRAMMAR BLOCK (v11.5/11.6 Logic)
         topic = sess.get('grammar_topic', 'general')
         final_prompt = BASE_PROMPT + TOPIC_RULES.get(topic, TOPIC_RULES["general"])
         final_prompt += f"\nSeed: {random.randint(1, 1000000)}"
@@ -167,10 +167,9 @@ async def handle_poll(p: PollAnswer):
     sess = user_sessions[uid]
     if p.option_ids[0] == sess['correct_id']: sess['score'] += 1
     
-    word_label = f"Example: " if 'word' in sess else "Rule: "
-    explanation = f"💡 {word_label}{sess.get('exp')}\n\n🇷🇺 <tg-spoiler>{sess.get('ru')}</tg-spoiler>"
+    label = "Example: " if 'word' in sess else "Rule: "
+    explanation = f"💡 {label}{sess.get('exp')}\n\n🇷🇺 <tg-spoiler>{sess.get('ru')}</tg-spoiler>"
     await bot.send_message(uid, explanation, parse_mode=ParseMode.HTML, disable_notification=True)
-    
     sess['step'] += 1; await asyncio.sleep(0.5); await send_next_step(uid)
 
 # --- 7. HANDLERS ---
@@ -241,7 +240,7 @@ async def handle_pdf(m: types.Message):
         db.add(Vocab(user_id=m.from_user.id, word=i))
     db.commit(); db.close(); await st.edit_text(f"✅ Added {len(items)} items from PDF.")
 
-# --- SPEAKING SECTION (REFACTORED FOR DEEP DIALOG) ---
+# --- SPEAKING SECTION ---
 @dp.message(F.text == "🎤 Speaking Practice")
 async def spk_menu(m: types.Message):
     st = await m.answer("⏳ Generating topics..."); res = await ai_request("5 catchy personal topics", "JSON: {\"topics\":[\"T1\"]}", True)
@@ -251,9 +250,7 @@ async def spk_menu(m: types.Message):
 @dp.callback_query(F.data.startswith("spk_st_"))
 async def spk_init(cb: types.CallbackQuery):
     topic = cb.data[7:]
-    # ПРАВКА: Бот начинает с личного вопроса
-    prompt = f"Topic: {topic}. Start a conversation by asking me a personal question about my thoughts, feelings, or experience with this. Strictly 2 sentences."
-    q = await ai_request(prompt, "Sympathetic friend. Do not test knowledge. Focus on emotions and experience.", False)
+    q = await ai_request(f"Topic: {topic}. Start a conversation by asking me a personal question about my experience. 2 sentences.", "Sympathetic friend.", False)
     user_sessions[cb.from_user.id] = {'type': 'speaking', 'history': [q]}
     await cb.message.answer(f"🗣 Topic: {topic}\n{q}")
     v = await generate_voice(q); await bot.send_voice(cb.message.chat.id, BufferedInputFile(v.read(), filename="q.ogg")); await cb.answer()
@@ -263,10 +260,7 @@ async def handle_voice(m: types.Message):
     if m.from_user.id not in user_sessions or user_sessions[m.from_user.id].get('type') != 'speaking': return
     file = await bot.get_file(m.voice.file_id); content = await bot.download_file(file.file_path)
     trans = client.audio.transcriptions.create(file=("v.ogg", content.read()), model="whisper-large-v3", language="en").text
-    # ПРАВКА: Бот продолжает разговор вопросами о чувствах/опыте
-    prompt = f"User said: {trans}. Reply empathetically and ask a follow-up question about my feelings, habits, or past experience related to this topic. Strictly 2 sentences."
-    resp = await ai_request(prompt, "Caring interlocutor. Keep it personal, not academic.", False)
-    user_sessions[m.from_user.id]['history'].append(trans)
+    resp = await ai_request(f"User: {trans}. Reply empathetically and ask about feelings/habits. 2 sentences.", "Caring interlocutor.", False)
     await m.answer(f"🗣 {resp}"); v = await generate_voice(resp)
     await bot.send_voice(m.chat.id, BufferedInputFile(v.read(), filename="r.ogg"))
 
@@ -285,13 +279,27 @@ async def manual_add(m: types.Message):
         db.add(Vocab(user_id=m.from_user.id, word=w))
     db.commit(); db.close(); await m.answer(f"✅ Added {len(lines)} items.")
 
+# --- 8. RUN & REMINDERS ---
 async def start_web_server():
     app = web.Application(); app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
 
+async def send_reminder():
+    db = SessionLocal()
+    try:
+        users = db.query(User.user_id).all()
+        for u in users:
+            try: await bot.send_message(u.user_id, "🔔 Time for English practice!")
+            except: pass
+    finally: db.close()
+
 async def main():
     init_db(); asyncio.create_task(start_web_server())
+    # Настройка уведомлений 5 раз в день
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18,21', minute=0))
+    scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
 if __name__ == "__main__": asyncio.run(main())
