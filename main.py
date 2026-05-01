@@ -296,9 +296,9 @@ async def send_reminder():
 
 async def main():
     init_db(); asyncio.create_task(start_web_server())
-    # Настройка уведомлений 5 раз в день
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_reminder, CronTrigger(hour='9,12,15,18,21', minute=0))
+    # Настройка уведомлений: теперь 6, 9, 12, 15, 18 UTC, что соответствует 9, 12, 15, 18, 21 по МСК
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_reminder, CronTrigger(hour='6,9,12,15,18', minute=0))
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True); await dp.start_polling(bot)
 
